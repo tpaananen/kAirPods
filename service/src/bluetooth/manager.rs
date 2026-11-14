@@ -122,6 +122,17 @@ impl ManagedDevice {
       self.aap_attempt = 0;
    }
 
+   /// Stops connecting and closes the AAP connection.
+   ///
+   /// Reports the disconnect only if a connection was open, so a connection whose packet
+   /// processor already reported its end is not reported twice.
+   async fn close_aap(&mut self, event_tx: &EventSender) {
+      self.stop_aap();
+      if self.device.disconnect().await {
+         event_tx.emit(&self.device, AirPodsEvent::DeviceDisconnected);
+      }
+   }
+
    /// Whether the manager should establish the AAP connection on its own.
    fn wants_aap(&self) -> bool {
       self.bluetooth_state == BluetoothState::Connected
@@ -613,7 +624,7 @@ impl ManagerActor {
             }
          },
          ManagerCommand::AdapterLost(name) => {
-            self.handle_adapter_lost(name);
+            self.handle_adapter_lost(name).await;
          },
          ManagerCommand::AdapterError(name, error) => {
             self.handle_adapter_error(&name, error);
@@ -628,7 +639,7 @@ impl ManagerActor {
             self.handle_bluetooth_connected(addr, adapter_name).await;
          },
          ManagerCommand::BluetoothDisconnected(addr) => {
-            self.handle_bluetooth_disconnected(addr);
+            self.handle_bluetooth_disconnected(addr).await;
          },
          ManagerCommand::AAPConnected(addr, attempt) => {
             self.handle_aap_connected(addr, attempt);
@@ -719,30 +730,30 @@ impl ManagerActor {
       }
    }
 
-   fn handle_adapter_lost(&mut self, name: SmolStr) {
+   async fn handle_adapter_lost(&mut self, name: SmolStr) {
       warn!("Adapter lost: {name}");
       self.stop_adapter_device_monitors(&name);
 
-      if let Some(info) = self.adapters.get_mut(&name) {
-         info.state = AdapterState::Lost;
-         // Abort the monitor handle
-         if let Some(handle) = info.monitor_handle.take() {
-            handle.abort();
-         }
+      let Some(info) = self.adapters.get_mut(&name) else {
+         return;
+      };
+      info.state = AdapterState::Lost;
+      // Abort the monitor handle
+      if let Some(handle) = info.monitor_handle.take() {
+         handle.abort();
+      }
+      info.next_retry = Some(time::Instant::now() + adapter_retry_delay(info.retry_count));
+      info.retry_count = info.retry_count.saturating_add(1);
 
-         // Mark all AAP connections on this adapter as failed
-         for device in self.devices.values_mut() {
-            if device.adapter_name == name {
-               device.aap_state = AAPState::Failed("Adapter lost");
-               device.stop_aap();
-               self
-                  .event_tx
-                  .emit(&device.device, AirPodsEvent::DeviceError);
-            }
+      // Close the AAP connections on this adapter and mark them as failed
+      for device in self.devices.values_mut() {
+         if device.adapter_name == name {
+            device.aap_state = AAPState::Failed("Adapter lost");
+            device.close_aap(&self.event_tx).await;
+            self
+               .event_tx
+               .emit(&device.device, AirPodsEvent::DeviceError);
          }
-
-         info.next_retry = Some(time::Instant::now() + adapter_retry_delay(info.retry_count));
-         info.retry_count = info.retry_count.saturating_add(1);
       }
    }
 
@@ -836,19 +847,15 @@ impl ManagerActor {
       }
    }
 
-   fn handle_bluetooth_disconnected(&mut self, addr: Address) {
+   async fn handle_bluetooth_disconnected(&mut self, addr: Address) {
       if let Some(device) = self.devices.get_mut(&addr)
          && device.bluetooth_state == BluetoothState::Connected
       {
          device.bluetooth_state = BluetoothState::Disconnected;
-
-         // Clean up AAP connection
-         device.stop_aap();
          device.aap_state = AAPState::Disconnected;
-
-         self
-            .event_tx
-            .emit(&device.device, AirPodsEvent::DeviceDisconnected);
+         // AAP cannot outlive the Bluetooth link: close it now instead of leaving the
+         // device reported as connected until the socket notices
+         device.close_aap(&self.event_tx).await;
       }
    }
 
@@ -920,11 +927,7 @@ impl ManagerActor {
    async fn handle_device_lost(&mut self, addr: Address) {
       self.device_monitors.remove(&addr);
       if let Some(mut device) = self.devices.remove(&addr) {
-         device.stop_aap();
-         device.device.disconnect().await;
-         self
-            .event_tx
-            .emit(&device.device, AirPodsEvent::DeviceDisconnected);
+         device.close_aap(&self.event_tx).await;
       }
    }
 
@@ -1031,14 +1034,9 @@ impl ManagerActor {
          .ok_or(AirPodsError::DeviceNotFound(addr))?;
 
       // Stop the connection and keep it down until the user or Bluetooth reconnects
-      device.stop_aap();
       device.aap_state = AAPState::Disconnected;
       device.user_disconnected = true;
-      device.device.disconnect().await;
-
-      self
-         .event_tx
-         .emit(&device.device, AirPodsEvent::DeviceDisconnected);
+      device.close_aap(&self.event_tx).await;
 
       Ok(())
    }
@@ -1129,7 +1127,14 @@ impl ManagerActor {
          if let Some(adapter_info) = self.adapters.get(&device.adapter_name)
             && let Ok(bluer_device) = adapter_info.adapter.device(*addr)
          {
-            let is_connected = bluer_device.is_connected().await.unwrap_or(false);
+            // A failed read says nothing about the link; the events or the next scan decide
+            let is_connected = match bluer_device.is_connected().await {
+               Ok(is_connected) => is_connected,
+               Err(e) => {
+                  debug!("Cannot read connection state of {addr}: {e}");
+                  continue;
+               },
+            };
 
             match (device.bluetooth_state, is_connected) {
                (BluetoothState::Connected, false) => {

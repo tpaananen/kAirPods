@@ -323,10 +323,15 @@ impl AirPods {
       Ok(jhandle)
    }
 
-   pub async fn disconnect(&self) {
+   /// Closes the connection and clears the reported state.
+   ///
+   /// Returns whether a connection was open. The caller reports the disconnect then:
+   /// the packet processor of a closed connection stays silent.
+   pub async fn disconnect(&self) -> bool {
       let mut conn = self.0.conn.write().await;
-      conn.take();
+      let was_open = conn.take().is_some();
       self.mark_disconnected();
+      was_open
    }
 
    /// Called by the packet processor of connection `conn_id` when that connection ended.
@@ -870,8 +875,11 @@ mod tests {
       let event_tx: EventSender = events.clone();
 
       set_connection(&device, 1).await;
-      device.disconnect().await;
+      assert!(device.disconnect().await);
       assert!(!device.is_connected());
+
+      // Nothing left to close
+      assert!(!device.disconnect().await);
 
       // The caller of disconnect() reports it; the processor must not report it again
       device.notify_disconnected(1, &event_tx).await;
