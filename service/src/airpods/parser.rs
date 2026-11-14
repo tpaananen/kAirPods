@@ -218,13 +218,19 @@ pub fn parse_ear_detection(data: &[u8], primary: Component) -> Result<EarDetecti
          .into(),
       );
    }
-   let primary_pod = PodPlacement::from_byte(data[6]);
-   let secondary_pod = PodPlacement::from_byte(data[7]);
-   Ok(if primary == Component::Right {
+   Ok(ear_detection_from_pods([data[6], data[7]], primary))
+}
+
+/// Maps the `[primary pod, secondary pod]` bytes of an ear detection packet to left and
+/// right; `primary` says which side the primary one is.
+pub fn ear_detection_from_pods(pods: [u8; 2], primary: Component) -> EarDetectionStatus {
+   let primary_pod = PodPlacement::from_byte(pods[0]);
+   let secondary_pod = PodPlacement::from_byte(pods[1]);
+   if primary == Component::Right {
       EarDetectionStatus::new(secondary_pod, primary_pod)
    } else {
       EarDetectionStatus::new(primary_pod, secondary_pod)
-   })
+   }
 }
 
 #[cfg(test)]

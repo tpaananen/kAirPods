@@ -66,6 +66,9 @@ struct AirPodsInner {
    is_connected: AtomicBool,
    connected_since: AtomicCell<Option<u64>>,
    ear_detection: AtomicCell<Option<EarDetectionStatus>>,
+   /// `[primary pod, secondary pod]` bytes of the last ear detection report, to map them
+   /// again when a battery report shows that the other earbud is primary
+   ear_detection_pods: AtomicCell<Option<[u8; 2]>>,
    /// The right earbud is the primary one, as last seen in a battery report
    right_is_primary: AtomicBool,
    noise_mode: AtomicCell<Option<NoiseControlMode>>,
@@ -363,6 +366,7 @@ impl AirPods {
       self.0.battery.store(None);
       self.0.noise_mode.store(None);
       self.0.ear_detection.store(None);
+      self.0.ear_detection_pods.store(None);
       self.0.battery_ttl.store(None);
       info!("Disconnected from {}", self.address());
    }
@@ -532,16 +536,53 @@ impl AirPods {
       }
    }
 
+   /// Records which earbud is primary, as seen in a battery report.
+   ///
+   /// Ear detection reports name the primary and secondary earbud, not left and right. If
+   /// the primary changed, or the last ear report came before the first battery report,
+   /// that report was mapped to the wrong sides: map it again.
+   fn set_primary_pod(&self, address: Address, primary: Component, event_tx: &EventSender) {
+      let right_is_primary = primary == Component::Right;
+      let changed = self
+         .0
+         .right_is_primary
+         .swap(right_is_primary, Ordering::Relaxed)
+         != right_is_primary;
+      if changed && let Some(pods) = self.0.ear_detection_pods.load() {
+         debug!("{address}: primary earbud is now {primary}, mapping ear detection again");
+         let status = parser::ear_detection_from_pods(pods, primary);
+         self.apply_ear_detection(address, status, event_tx);
+      }
+   }
+
+   /// Stores an ear detection status and reports it if it changed.
+   fn apply_ear_detection(
+      &self,
+      address: Address,
+      status: EarDetectionStatus,
+      event_tx: &EventSender,
+   ) {
+      debug!(
+         "Ear detection updated for {}: L:{} R:{} (in case L:{} R:{})",
+         address,
+         status.is_left_in_ear(),
+         status.is_right_in_ear(),
+         status.is_left_in_case(),
+         status.is_right_in_case()
+      );
+      let previous = self.update_ear_detection(status);
+      if previous != Some(status) {
+         event_tx.emit(self, AirPodsEvent::EarDetectionChanged { status, previous });
+      }
+   }
+
    fn process_packet(&self, address: Address, packet: Packet, event_tx: &EventSender) {
       // Battery status
       if packet.starts_with(HDR_BATTERY_STATE) {
          match parser::parse_battery_status(&packet) {
             Ok(battery) => {
                if let Some(primary) = parser::primary_pod(&packet) {
-                  self
-                     .0
-                     .right_is_primary
-                     .store(primary == Component::Right, Ordering::Relaxed);
+                  self.set_primary_pod(address, primary, event_tx);
                }
                debug!(
                   "Battery updated for {}: L:{}% R:{}% C:{}%",
@@ -576,19 +617,12 @@ impl AirPods {
       else if packet.starts_with(HDR_EAR_DETECTION) {
          match parser::parse_ear_detection(&packet, self.primary_pod()) {
             Ok(status) => {
-               debug!(
-                  "Ear detection updated for {}: L:{} R:{} (in case L:{} R:{})",
-                  address,
-                  status.is_left_in_ear(),
-                  status.is_right_in_ear(),
-                  status.is_left_in_case(),
-                  status.is_right_in_case()
-               );
-
-               let previous = self.update_ear_detection(status);
-               if previous != Some(status) {
-                  event_tx.emit(self, AirPodsEvent::EarDetectionChanged { status, previous });
-               }
+               // Parsing checked the length
+               self
+                  .0
+                  .ear_detection_pods
+                  .store(Some([packet[6], packet[7]]));
+               self.apply_ear_detection(address, status, event_tx);
             },
             Err(e) => warn!("Failed to parse ear detection: {e}"),
          }
@@ -723,6 +757,7 @@ mod tests {
    use crate::{
       airpods::protocol::{BatteryStatus, PodPlacement},
       event::EventBus,
+      media_control,
    };
 
    #[tokio::test]
@@ -859,6 +894,57 @@ mod tests {
       device.disconnect().await;
       report(0, 0);
       assert_eq!(first_reports(), [true]);
+   }
+
+   #[tokio::test]
+   async fn ear_detection_follows_a_later_primary_change() {
+      let device = AirPods::new(Address::default(), "test".into(), None, None);
+      let events = Arc::new(RecordedEvents::default());
+      let event_tx: EventSender = events.clone();
+      let ear = |primary: u8, secondary: u8| {
+         let mut packet = Packet::from_slice(HDR_EAR_DETECTION);
+         packet.extend([primary, secondary]);
+         device.process_packet(device.address(), packet, &event_tx);
+      };
+      let battery_with_primary = |primary: Component, secondary: Component| {
+         let packet = battery_packet(&[
+            (primary, 80, BatteryStatus::Discharging),
+            (secondary, 80, BatteryStatus::Discharging),
+         ]);
+         device.process_packet(device.address(), packet, &event_tx);
+      };
+      let ear_events = || -> Vec<(Option<EarDetectionStatus>, EarDetectionStatus)> {
+         events
+            .0
+            .lock()
+            .drain(..)
+            .filter_map(|event| match event {
+               AirPodsEvent::EarDetectionChanged { status, previous } => Some((previous, status)),
+               _ => None,
+            })
+            .collect()
+      };
+
+      // Primary out of ear, secondary in, before any battery report: left is assumed primary
+      ear(0x01, 0x00);
+      let status = device.ear_detection().unwrap();
+      assert!(!status.is_left_in_ear() && status.is_right_in_ear());
+
+      // The battery report shows the right earbud is primary: the sides are swapped
+      battery_with_primary(Component::Right, Component::Left);
+      let status = device.ear_detection().unwrap();
+      assert!(status.is_left_in_ear() && !status.is_right_in_ear());
+
+      // Reported once, with the same number of buds in an ear, so playback is left alone
+      let reports = ear_events();
+      assert_eq!(reports.len(), 2);
+      let (previous, status) = reports[1];
+      assert_eq!(previous.unwrap().in_ear_count(), status.in_ear_count());
+      assert_eq!(media_control::playback_action(previous, status), None);
+
+      // An unchanged primary maps nothing again
+      battery_with_primary(Component::Right, Component::Left);
+      assert!(ear_events().is_empty());
    }
 
    #[tokio::test]
