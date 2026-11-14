@@ -1118,9 +1118,14 @@ impl ManagerActor {
       }
    }
 
+   /// Runs the periodic device work, which may write to the battery study database.
+   ///
+   /// The writes wait for the disk, so they run on the blocking pool instead of holding
+   /// up the commands queued for the manager.
    fn tick_all_devices(&self) {
       for device in self.devices.values() {
-         device.device.tick();
+         let device = device.device.clone();
+         tokio::task::spawn_blocking(move || device.tick());
       }
    }
 
