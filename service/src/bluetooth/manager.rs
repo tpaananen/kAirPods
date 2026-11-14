@@ -5,7 +5,9 @@
 
 use std::{collections::HashMap, time::Duration};
 
-use bluer::{Adapter, AdapterEvent, AdapterProperty, Address, Session};
+use bluer::{
+   Adapter, AdapterEvent, AdapterProperty, Address, DeviceEvent, DeviceProperty, Session,
+};
 use futures::stream::StreamExt;
 use log::{debug, error, info, warn};
 use smol_str::SmolStr;
@@ -25,8 +27,8 @@ use crate::{
 };
 use rand::Rng;
 
-/// Interval to poll for new devices and check connection health
-const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// Interval of the scan that catches connection changes the device events missed
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// Interval to check for new adapters
 const ADAPTER_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// Delay before the first adapter recovery attempt; doubles per failure
@@ -61,6 +63,18 @@ struct AdapterInfo {
 }
 
 // === Device Management ===
+
+/// Watches one `BlueZ` device for Bluetooth connection changes.
+struct DeviceMonitor {
+   adapter_name: SmolStr,
+   handle: JoinHandle<()>,
+}
+
+impl Drop for DeviceMonitor {
+   fn drop(&mut self) {
+      self.handle.abort();
+   }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 enum BluetoothState {
@@ -126,8 +140,9 @@ enum ManagerCommand {
    AdapterError(SmolStr, String), // adapter_name, error
 
    // Device events
-   DeviceDiscovered(Address, SmolStr), // address, adapter_name
-   BluetoothConnected(Address),
+   DeviceAdded(Address, SmolStr),        // address, adapter_name
+   DeviceDiscovered(Address, SmolStr),   // address, adapter_name
+   BluetoothConnected(Address, SmolStr), // address, adapter_name
    BluetoothDisconnected(Address),
    AAPConnected(Address, u64),          // address, attempt
    AAPDisconnected(Address, u64, bool), // address, attempt, is_error
@@ -254,6 +269,8 @@ struct ManagerActor {
    // State
    adapters: HashMap<SmolStr, AdapterInfo>,
    devices: HashMap<Address, ManagedDevice>,
+   /// Tasks reporting Bluetooth connection changes, for every device of an active adapter
+   device_monitors: HashMap<Address, DeviceMonitor>,
    /// Source of unique AAP connection attempt ids
    next_attempt: u64,
 }
@@ -279,6 +296,7 @@ impl ManagerActor {
          shutdown_reply: None,
          adapters: HashMap::new(),
          devices: HashMap::new(),
+         device_monitors: HashMap::new(),
          next_attempt: 0,
       })
    }
@@ -290,7 +308,12 @@ impl ManagerActor {
       self.initialize_adapters().await;
 
       // Start periodic checks
-      let mut health_check_interval = time::interval(HEALTH_CHECK_INTERVAL);
+      // The first scan waits a full interval: at startup the device monitors report
+      // what is connected, and a scan racing them would log their work as missed
+      let mut health_check_interval = time::interval_at(
+         time::Instant::now() + HEALTH_CHECK_INTERVAL,
+         HEALTH_CHECK_INTERVAL,
+      );
       health_check_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
       let mut adapter_check_interval = time::interval(ADAPTER_CHECK_INTERVAL);
@@ -459,7 +482,7 @@ impl ManagerActor {
                AdapterEvent::DeviceAdded(addr) => {
                   debug!("Device added on {name}: {addr}");
                   let _ = loopback
-                     .send(ManagerCommand::DeviceDiscovered(addr, name.clone()))
+                     .send(ManagerCommand::DeviceAdded(addr, name.clone()))
                      .await;
                },
                AdapterEvent::DeviceRemoved(addr) => {
@@ -471,8 +494,7 @@ impl ManagerActor {
                      .send(ManagerCommand::AdapterPowered(name.clone()))
                      .await;
                },
-               // Note: bluer doesn't provide DeviceConnected/Disconnected events
-               // We'll detect connection changes through periodic scanning
+               // Connection changes are reported by the device monitors
                _ => {},
             }
          }
@@ -484,28 +506,90 @@ impl ManagerActor {
       })
    }
 
-   async fn check_connected_devices(&self, adapter_name: &SmolStr) {
+   /// Starts reporting Bluetooth connection changes of the device at `addr`.
+   ///
+   /// The monitor first reports the device if it is already connected, so devices
+   /// connected before it started are found too.
+   fn monitor_device(&mut self, addr: Address, adapter_name: &SmolStr) {
+      if self
+         .device_monitors
+         .get(&addr)
+         .is_some_and(|monitor| !monitor.handle.is_finished())
+      {
+         return;
+      }
       let Some(adapter_info) = self.adapters.get(adapter_name) else {
          return;
       };
-
-      let Ok(addresses) = adapter_info.adapter.device_addresses().await else {
-         return;
+      let device = match adapter_info.adapter.device(addr) {
+         Ok(device) => device,
+         Err(e) => {
+            debug!("Cannot monitor {addr}: {e}");
+            return;
+         },
       };
 
-      for addr in addresses {
-         if let Ok(device) = adapter_info.adapter.device(addr)
-            && device.is_connected().await == Ok(true)
-            && self.is_airpods_device(&device).await
-            && !self.devices.contains_key(&addr)
-         {
-            // Found a connected AirPods device without AAP connection
-            let _ = self
-               .loopback_tx
-               .send(ManagerCommand::DeviceDiscovered(addr, adapter_name.clone()))
+      let loopback = self.loopback_tx.clone();
+      let name = adapter_name.clone();
+      let handle = tokio::spawn(async move {
+         let events = match device.events().await {
+            Ok(events) => events,
+            Err(e) => {
+               warn!("Failed to watch {addr} for connection changes: {e}");
+               return;
+            },
+         };
+         futures::pin_mut!(events);
+
+         if device.is_connected().await == Ok(true) {
+            let _ = loopback
+               .send(ManagerCommand::BluetoothConnected(addr, name.clone()))
                .await;
          }
+
+         // Ends when the device is removed from BlueZ
+         while let Some(DeviceEvent::PropertyChanged(property)) = events.next().await {
+            let command = match property {
+               DeviceProperty::Connected(true) => {
+                  ManagerCommand::BluetoothConnected(addr, name.clone())
+               },
+               DeviceProperty::Connected(false) => ManagerCommand::BluetoothDisconnected(addr),
+               _ => continue,
+            };
+            if loopback.send(command).await.is_err() {
+               return;
+            }
+         }
+      });
+      self.device_monitors.insert(
+         addr,
+         DeviceMonitor {
+            adapter_name: adapter_name.clone(),
+            handle,
+         },
+      );
+   }
+
+   /// Starts monitoring every device of the adapter.
+   async fn monitor_adapter_devices(&mut self, adapter_name: &SmolStr) {
+      let Some(adapter_info) = self.adapters.get(adapter_name) else {
+         return;
+      };
+      match adapter_info.adapter.device_addresses().await {
+         Ok(addresses) => {
+            for addr in addresses {
+               self.monitor_device(addr, adapter_name);
+            }
+         },
+         Err(e) => warn!("Failed to list devices of {adapter_name}: {e}"),
       }
+   }
+
+   /// Stops monitoring the devices of the adapter.
+   fn stop_adapter_device_monitors(&mut self, adapter_name: &SmolStr) {
+      self
+         .device_monitors
+         .retain(|_, monitor| monitor.adapter_name != *adapter_name);
    }
 
    async fn is_airpods_device(&self, device: &bluer::Device) -> bool {
@@ -534,11 +618,14 @@ impl ManagerActor {
          ManagerCommand::AdapterError(name, error) => {
             self.handle_adapter_error(&name, error);
          },
+         ManagerCommand::DeviceAdded(addr, adapter_name) => {
+            self.monitor_device(addr, &adapter_name);
+         },
          ManagerCommand::DeviceDiscovered(addr, adapter_name) => {
             self.handle_device_discovered(addr, adapter_name).await;
          },
-         ManagerCommand::BluetoothConnected(addr) => {
-            self.handle_bluetooth_connected(addr).await;
+         ManagerCommand::BluetoothConnected(addr, adapter_name) => {
+            self.handle_bluetooth_connected(addr, adapter_name).await;
          },
          ManagerCommand::BluetoothDisconnected(addr) => {
             self.handle_bluetooth_disconnected(addr);
@@ -615,8 +702,8 @@ impl ManagerActor {
             ));
          }
 
-         // Re-check connected devices and trigger reconnects
-         self.check_connected_devices(&name).await;
+         // Watch its devices; connected ones are reported right away
+         self.monitor_adapter_devices(&name).await;
 
          // Try to reconnect failed AAP connections on this adapter
          let devices_to_reconnect: Vec<Address> = self
@@ -634,6 +721,7 @@ impl ManagerActor {
 
    fn handle_adapter_lost(&mut self, name: SmolStr) {
       warn!("Adapter lost: {name}");
+      self.stop_adapter_device_monitors(&name);
 
       if let Some(info) = self.adapters.get_mut(&name) {
          info.state = AdapterState::Lost;
@@ -659,6 +747,7 @@ impl ManagerActor {
    }
 
    fn handle_adapter_error(&mut self, name: &SmolStr, error: String) {
+      self.stop_adapter_device_monitors(name);
       if let Some(info) = self.adapters.get_mut(name)
          && let Some(handle) = info.monitor_handle.take()
       {
@@ -728,38 +817,29 @@ impl ManagerActor {
       let _ = self.establish_aap_connection(addr).await;
    }
 
-   async fn handle_bluetooth_connected(&mut self, addr: Address) {
-      // Check if this is an AirPods device
-      let is_airpods = if let Some(device) = self.devices.get_mut(&addr) {
-         device.bluetooth_state = BluetoothState::Connected;
-         // A new Bluetooth session connects automatically again
-         device.user_disconnected = false;
-         true
-      } else {
-         // Check if this is a newly connected AirPods
-         for (adapter_name, adapter_info) in &self.adapters {
-            if let Ok(device) = adapter_info.adapter.device(addr)
-               && self.is_airpods_device(&device).await
-            {
-               // Discovered a new connected AirPods
-               let _ = self
-                  .loopback_tx
-                  .send(ManagerCommand::DeviceDiscovered(addr, adapter_name.clone()))
-                  .await;
-               return;
-            }
-         }
-         false
+   async fn handle_bluetooth_connected(&mut self, addr: Address, adapter_name: SmolStr) {
+      let Some(device) = self.devices.get_mut(&addr) else {
+         // Not managed yet: adopted if it is AirPods
+         self.handle_device_discovered(addr, adapter_name).await;
+         return;
       };
+      // Reported again by the scan or a restarted monitor: nothing changed
+      if device.bluetooth_state == BluetoothState::Connected {
+         return;
+      }
 
-      if is_airpods {
-         // Automatically establish AAP connection
-         let _ = self.establish_aap_connection(addr).await;
+      device.bluetooth_state = BluetoothState::Connected;
+      // A new Bluetooth session connects automatically again
+      device.user_disconnected = false;
+      if let Err(e) = self.establish_aap_connection(addr).await {
+         debug!("AAP connection to {addr} not started: {e}");
       }
    }
 
    fn handle_bluetooth_disconnected(&mut self, addr: Address) {
-      if let Some(device) = self.devices.get_mut(&addr) {
+      if let Some(device) = self.devices.get_mut(&addr)
+         && device.bluetooth_state == BluetoothState::Connected
+      {
          device.bluetooth_state = BluetoothState::Disconnected;
 
          // Clean up AAP connection
@@ -838,6 +918,7 @@ impl ManagerActor {
    }
 
    async fn handle_device_lost(&mut self, addr: Address) {
+      self.device_monitors.remove(&addr);
       if let Some(mut device) = self.devices.remove(&addr) {
          device.stop_aap();
          device.device.disconnect().await;
@@ -975,6 +1056,8 @@ impl ManagerActor {
          }
       }
 
+      self.device_monitors.clear();
+
       // Abort AAP handles and disconnect all devices
       for device in self.devices.values_mut() {
          if let Some(handle) = device.retry_handle.take() {
@@ -1013,12 +1096,15 @@ impl ManagerActor {
          // Check all connected devices
          if let Ok(addresses) = adapter_info.adapter.device_addresses().await {
             for addr in addresses {
-               if let Ok(device) = adapter_info.adapter.device(addr)
+               // Managed devices count only if they should be connecting on their own:
+               // connected, connecting, waiting for a retry or disconnected by the user
+               // are all as expected
+               if self.devices.get(&addr).is_none_or(ManagedDevice::wants_aap)
+                  && let Ok(device) = adapter_info.adapter.device(addr)
                   && device.is_connected().await.unwrap_or(false)
                   && self.is_airpods_device(&device).await
-                  && !self.has_aap_connection(addr)
                {
-                  // Found connected AirPods without AAP connection
+                  info!("Scan found connected AirPods {addr} without AAP; events missed it");
                   let _ = self
                      .loopback_tx
                      .send(ManagerCommand::DeviceDiscovered(
@@ -1030,13 +1116,6 @@ impl ManagerActor {
             }
          }
       }
-   }
-
-   fn has_aap_connection(&self, addr: Address) -> bool {
-      self
-         .devices
-         .get(&addr)
-         .is_some_and(|d| matches!(d.aap_state, AAPState::Connected | AAPState::Connecting))
    }
 
    fn tick_all_devices(&self) {
@@ -1054,15 +1133,20 @@ impl ManagerActor {
 
             match (device.bluetooth_state, is_connected) {
                (BluetoothState::Connected, false) => {
+                  info!("Scan found {addr} disconnected; events missed it");
                   let _ = self
                      .loopback_tx
                      .send(ManagerCommand::BluetoothDisconnected(*addr))
                      .await;
                },
                (BluetoothState::Disconnected, true) => {
+                  info!("Scan found {addr} connected; events missed it");
                   let _ = self
                      .loopback_tx
-                     .send(ManagerCommand::BluetoothConnected(*addr))
+                     .send(ManagerCommand::BluetoothConnected(
+                        *addr,
+                        device.adapter_name.clone(),
+                     ))
                      .await;
                },
                _ => {},
