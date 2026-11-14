@@ -160,7 +160,7 @@ enum ManagerCommand {
    AAPConnected(Address, u64),          // address, attempt
    AAPDisconnected(Address, u64, bool), // address, attempt, is_error
    RetryAAP(Address, u64),              // address, attempt
-   DeviceLost(Address),
+   DeviceLost(Address, SmolStr),        // address, adapter_name
 
    // User commands
    EstablishAAP(Address, oneshot::Sender<Result<()>>),
@@ -500,7 +500,9 @@ impl ManagerActor {
                },
                AdapterEvent::DeviceRemoved(addr) => {
                   debug!("Device removed on {name}: {addr}");
-                  let _ = loopback.send(ManagerCommand::DeviceLost(addr)).await;
+                  let _ = loopback
+                     .send(ManagerCommand::DeviceLost(addr, name.clone()))
+                     .await;
                },
                AdapterEvent::PropertyChanged(AdapterProperty::Powered(true)) => {
                   let _ = loopback
@@ -554,13 +556,20 @@ impl ManagerActor {
          };
          futures::pin_mut!(events);
 
-         if device.is_connected().await == Ok(true) {
-            let _ = loopback
-               .send(ManagerCommand::BluetoothConnected(addr, name.clone()))
-               .await;
+         // Report the current state both ways: a monitor restarted after its stream ended
+         // must not miss a change that happened in between
+         let initial = match device.is_connected().await {
+            Ok(true) => Some(ManagerCommand::BluetoothConnected(addr, name.clone())),
+            Ok(false) => Some(ManagerCommand::BluetoothDisconnected(addr)),
+            Err(_) => None,
+         };
+         if let Some(command) = initial
+            && loopback.send(command).await.is_err()
+         {
+            return;
          }
 
-         // Ends when the device is removed from BlueZ
+         // Ends when BlueZ removes the device, or any one of its interfaces
          while let Some(DeviceEvent::PropertyChanged(property)) = events.next().await {
             let command = match property {
                DeviceProperty::Connected(true) => {
@@ -652,8 +661,8 @@ impl ManagerActor {
          ManagerCommand::RetryAAP(addr, attempt) => {
             self.handle_aap_retry(addr, attempt).await;
          },
-         ManagerCommand::DeviceLost(addr) => {
-            self.handle_device_lost(addr).await;
+         ManagerCommand::DeviceLost(addr, adapter_name) => {
+            self.handle_device_lost(addr, adapter_name).await;
          },
          ManagerCommand::EstablishAAP(addr, reply) => {
             // An explicit request lifts an earlier user disconnect
@@ -926,8 +935,29 @@ impl ManagerActor {
       }
    }
 
-   async fn handle_device_lost(&mut self, addr: Address) {
+   /// Handles a device reported as removed from `BlueZ`.
+   ///
+   /// bluer reports the removal of any interface of a device as the device being removed,
+   /// and ends its event stream. `BlueZ` removes `Battery1` on every disconnect, so the
+   /// device is forgotten only if `BlueZ` no longer lists it; otherwise it is watched again.
+   async fn handle_device_lost(&mut self, addr: Address, adapter_name: SmolStr) {
+      // The monitor's event stream has ended either way
       self.device_monitors.remove(&addr);
+
+      let still_listed = match self.adapters.get(&adapter_name) {
+         Some(info) => info
+            .adapter
+            .device_addresses()
+            .await
+            .is_ok_and(|addresses| addresses.contains(&addr)),
+         None => false,
+      };
+      if still_listed {
+         debug!("{addr} lost a BlueZ interface but is still present, watching it again");
+         self.monitor_device(addr, &adapter_name);
+         return;
+      }
+
       if let Some(mut device) = self.devices.remove(&addr) {
          device.close_aap(&self.event_tx).await;
       }
