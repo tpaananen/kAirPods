@@ -129,12 +129,6 @@ impl BatteryHistory {
       self.unsaved = 0;
    }
 
-   /// Keeps only the most recent `count` samples.
-   fn truncate_front(&mut self, count: usize) {
-      self.samples.truncate_front(count);
-      self.unsaved = self.unsaved.min(self.len());
-   }
-
    fn last_level(&self) -> Option<u8> {
       if self.is_empty() {
          None
@@ -868,9 +862,6 @@ impl BatteryTracker {
             Err(e) => warn!("Failed to save battery drain rate for {address}: {e}"),
          }
       }
-
-      // Keep last few samples for continuity
-      self.trim_history();
    }
 
    /// Saves the drain data of a connection that ended and starts the next one afresh.
@@ -884,17 +875,6 @@ impl BatteryTracker {
       self.right_history.clear();
       self.last_ttl_estimate = None;
       self.last_save = None;
-   }
-
-   /// Trims battery history keeping only recent samples for continuity.
-   fn trim_history(&mut self) {
-      const KEEP_COUNT: usize = 5;
-
-      for history in [&mut self.left_history, &mut self.right_history] {
-         if history.len() > KEEP_COUNT {
-            history.truncate_front(KEEP_COUNT);
-         }
-      }
    }
 }
 
@@ -1279,6 +1259,51 @@ mod tests {
       assert_eq!(saved_samples()?, Some(9));
 
       Ok(())
+   }
+
+   /// Records one 1% drop every 3.5 minutes (~17.1 %/hr) on both buds, from 100%.
+   fn record_drops(tracker: &mut BatteryTracker, base_time: Instant, range: std::ops::Range<u64>) {
+      for i in range {
+         let timestamp = base_time + Duration::from_secs(i * 210);
+         tracker.left_history.push(timestamp, 100 - i as u8);
+         tracker.right_history.push(timestamp, 100 - i as u8);
+      }
+   }
+
+   #[test]
+   fn test_save_keeps_history_for_the_drain_rate() -> Result<()> {
+      let (study, _dir) = create_test_db()?;
+      study.get_or_create_study(TEST_ADDRESS, SmolStr::new_static("Test AirPods"))?;
+      let mut tracker = BatteryTracker::new(Some(study));
+      let base_time = Instant::now();
+
+      record_drops(&mut tracker, base_time, 0..8);
+      tracker.save_to_study(TEST_ADDRESS, NoiseControlMode::Off);
+      assert_eq!(tracker.unsaved_samples(), 0);
+
+      // Every sample stays for the local drain rate
+      assert_eq!(tracker.left_history.len(), 8);
+      assert_eq!(tracker.right_history.len(), 8);
+
+      // Samples before and after the save form one history: the rate uses all 12 and
+      // gets the weighting for 10 or more samples
+      record_drops(&mut tracker, base_time, 8..12);
+      let (rate, alpha, sample_count) = tracker.calculate_local_drain_rate().unwrap();
+      assert_eq!(sample_count, 12);
+      assert!((alpha - 0.3).abs() < f64::EPSILON);
+      assert!((rate - 3600.0 / 210.0).abs() < 0.01, "rate {rate}");
+      Ok(())
+   }
+
+   #[test]
+   fn test_history_without_saves_is_bounded_by_the_ring() {
+      let mut tracker = BatteryTracker::new(None);
+      record_drops(&mut tracker, Instant::now(), 0..40);
+
+      // The oldest samples are dropped, the newest kept
+      assert_eq!(tracker.left_history.len(), BATTERY_HISTORY_SIZE);
+      assert_eq!(tracker.left_history.last_level(), Some(61));
+      assert_eq!(tracker.unsaved_samples(), BATTERY_HISTORY_SIZE);
    }
 
    #[test]

@@ -94,16 +94,6 @@ impl<T: Default + Copy, const N: usize> Ring<T, N> {
       let (left, right) = self.as_slices();
       RingIter { left, right }
    }
-
-   /// Keep only the most-recent `count` elements.
-   pub fn truncate_front(&mut self, count: usize) {
-      if count >= self.len() {
-         return;
-      }
-      let oldest = (self.tail - count) % N;
-      self.data.rotate_left(oldest);
-      self.tail = count;
-   }
 }
 
 impl<T: Default + Copy, const N: usize> Extend<T> for Ring<T, N> {
@@ -190,19 +180,6 @@ mod tests {
       rb.push(4); // overwrites 1
       assert_eq!(rb.len(), 3);
       assert_eq!(rb.last(), Some(&4));
-   }
-
-   #[test]
-   fn truncate_front_keeps_recent() {
-      let mut rb: Ring<i32, 5> = Ring::new();
-      for i in 1..=7 {
-         rb.push(i);
-      } // logical contents: [3,4,5,6,7]
-      rb.truncate_front(3);
-      assert_eq!(rb.iter().copied().collect::<Vec<_>>(), vec![5, 6, 7]);
-
-      rb.truncate_front(0);
-      assert!(rb.is_empty());
    }
 
    #[test]
