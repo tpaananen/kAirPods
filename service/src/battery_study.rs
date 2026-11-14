@@ -57,6 +57,10 @@ const MIN_SAMPLES_TO_SAVE: usize = 3;
 /// Keeps new sessions relevant as the battery ages, and bounds the sample counts that
 /// earlier versions inflated by saving the same samples on every tick.
 const MAX_STUDY_SAMPLES: u32 = 200;
+/// Rise in level, in points, that can only mean the battery was charged.
+///
+/// Smaller rises are treated as measurement wobble and ignored.
+const RECHARGE_MIN_RISE: u8 = 3;
 
 static BASE_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 
@@ -140,18 +144,23 @@ impl BatteryHistory {
 
    fn record_battery_drop(&mut self, level: u8, timestamp: Instant) {
       // Not charging, record battery level
-      if let Some(last_level) = self.last_level() {
-         if level >= last_level {
-            return;
-         }
-         let elapsed = timestamp.duration_since(*BASE_TIME).as_secs_f64();
-         debug!(
-            "Battery dropped from {last_level} to {level} (sample #{}, elapsed: {:.1}s)",
-            self.len() + 1,
-            elapsed
-         );
-      } else {
-         debug!("Recording initial battery level: {level} (first sample)");
+      match self.last_level() {
+         Some(last_level) if level >= last_level.saturating_add(RECHARGE_MIN_RISE) => {
+            // Charged without a charging report reaching us, typically while disconnected.
+            // The old samples belong to an earlier discharge, so start over from here.
+            debug!("Battery rose from {last_level} to {level}, restarting battery history");
+            self.clear();
+         },
+         Some(last_level) if level >= last_level => return,
+         Some(last_level) => {
+            let elapsed = timestamp.duration_since(*BASE_TIME).as_secs_f64();
+            debug!(
+               "Battery dropped from {last_level} to {level} (sample #{}, elapsed: {:.1}s)",
+               self.len() + 1,
+               elapsed
+            );
+         },
+         None => debug!("Recording initial battery level: {level} (first sample)"),
       }
       self.push(timestamp, level);
    }
@@ -1072,6 +1081,36 @@ mod tests {
       // Left history should be cleared, right should remain
       assert_eq!(tracker.left_history.len(), 0);
       assert!(!tracker.right_history.is_empty());
+   }
+
+   #[test]
+   fn test_recharge_without_charging_report_restarts_history() {
+      let mut tracker = BatteryTracker::new(None);
+      let record = |tracker: &mut BatteryTracker, left: u8, right: u8| {
+         tracker.record_battery_drop(mock_state(left, false), mock_state(right, false));
+      };
+
+      for level in [80, 79, 78, 77, 76] {
+         record(&mut tracker, level, level);
+      }
+      assert_eq!(tracker.left_history.len(), 5);
+
+      // A rise of a point or two is wobble, not a recharge
+      record(&mut tracker, 78, 77);
+      assert_eq!(tracker.left_history.len(), 5);
+      assert_eq!(tracker.left_history.last_level(), Some(76));
+      assert_eq!(tracker.right_history.len(), 5);
+
+      // Left bud was charged while disconnected: no charging report was ever seen
+      record(&mut tracker, 100, 76);
+      assert_eq!(tracker.left_history.len(), 1);
+      assert_eq!(tracker.left_history.last_level(), Some(100));
+      assert_eq!(tracker.right_history.len(), 5);
+
+      // Drain is recorded again right away, not only below the old level
+      record(&mut tracker, 99, 76);
+      assert_eq!(tracker.left_history.len(), 2);
+      assert_eq!(tracker.left_history.last_level(), Some(99));
    }
 
    #[test]
