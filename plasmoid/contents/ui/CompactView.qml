@@ -69,8 +69,12 @@ Item {
                 id: icon
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.left: parent.left
+                // Shrink the glyph (keeping it centered in its slot) so the
+                // battery ring has breathing room without growing overall.
+                anchors.leftMargin: (slotWidth - width) / 2
                 visible: content.showIcon
-                width: root.showPercentage ? content.iconSize : content.width
+                readonly property real slotWidth: root.showPercentage ? content.iconSize : content.width
+                width: slotWidth * 0.8
                 height: width
                 source: "audio-headphones"
 
@@ -83,61 +87,55 @@ Item {
                     }
                 }
 
-                // Modern battery badge
-                Item {
-                    visible: !root.showPercentage && batteryLevels.length > 0
-                    anchors.bottom: parent.bottom
-                    anchors.right: parent.right
-                    anchors.margins: -2
+                // Battery ring: faint track plus an arc showing the charge
+                Canvas {
+                    id: batteryRing
+                    visible: batteryLevels.length > 0
+                    anchors.centerIn: parent
+                    width: Math.round(parent.width * 1.6)
+                    height: width
+                    rotation: -90 // start from top
 
-                    width: batteryBadge.width + Kirigami.Units.smallSpacing * 2
-                    height: batteryBadge.height + Kirigami.Units.smallSpacing
+                    property real progress: Math.max(0, Math.min(100, averageBattery)) / 100
+                    property color progressColor: averageBattery < 20 ? "#F44336"
+                                                : averageBattery < 50 ? "#FF9800"
+                                                : "#4CAF50"
+                    property color trackColor: Kirigami.ColorUtils.adjustColor(Kirigami.Theme.textColor, {"alpha": -200})
 
-                    // Shadow layers
-                    Rectangle {
-                        anchors.fill: badgeBackground
-                        anchors.topMargin: 1
-                        anchors.leftMargin: 1
-                        radius: badgeBackground.radius
-                        color: Qt.rgba(0, 0, 0, 0.3)
-                        z: -1
+                    onProgressChanged: requestPaint()
+                    onProgressColorChanged: requestPaint()
+                    onTrackColorChanged: requestPaint()
+                    onWidthChanged: requestPaint()
+
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.reset()
+                        var c = width / 2
+                        var r = c - 2
+                        ctx.lineWidth = 3
+                        ctx.lineCap = "round"
+
+                        ctx.beginPath()
+                        ctx.arc(c, c, r, 0, 2 * Math.PI)
+                        ctx.strokeStyle = trackColor
+                        ctx.stroke()
+
+                        if (progress > 0) {
+                            ctx.beginPath()
+                            ctx.arc(c, c, r, 0, 2 * Math.PI * progress)
+                            ctx.strokeStyle = progressColor
+                            ctx.stroke()
+                        }
                     }
 
-                    Rectangle {
-                        id: badgeBackground
-                        anchors.fill: parent
-                        radius: height / 2
-
-                        color: {
-                            if (averageBattery < 20) return "#e74c3c"
-                            if (averageBattery < 50) return "#f39c12"
-                            return "#27ae60"
-                        }
-
-                        // Glass-like effect
-                        Rectangle {
-                            anchors.fill: parent
-                            anchors.margins: 1
-                            radius: parent.radius
-                            color: Qt.rgba(255, 255, 255, 0.2)
-                            z: 1
-                        }
-
-                        PlasmaComponents3.Label {
-                            id: batteryBadge
-                            anchors.centerIn: parent
-                            text: i18nc("Battery level; %1 is a percentage", "%1%", averageBattery)
-                            font.pixelSize: Kirigami.Units.gridUnit * 0.5
-                            font.bold: true
-                            color: "white"
-                            z: 2
-                        }
+                    Behavior on progress {
+                        NumberAnimation { duration: 800; easing.type: Easing.InOutCubic }
                     }
                 }
 
                 // Connection pulse
                 Rectangle {
-                    visible: showPulseAnimation && device && device.connected
+                    visible: showPulseAnimation && device && device.connected && batteryLevels.length === 0
                     anchors.centerIn: parent
                     width: parent.width + 2 * Math.round(parent.width * 0.15)
                     height: width
