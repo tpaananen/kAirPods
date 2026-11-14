@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import org.kde.kirigami as Kirigami
 import "depth.js" as Depth
+import "battery.js" as Battery
 
 Item {
     id: root
@@ -69,12 +70,7 @@ Item {
             rotation: -90 // Start from top
 
             property real progress: level / 100
-            property color progressColor: {
-                if (charging) return "#4CAF50"
-                if (level < 20) return "#F44336"
-                if (level < 50) return "#FF9800"
-                return "#4CAF50"
-            }
+            property color progressColor: Battery.levelColor(level, charging)
 
             onProgressChanged: requestPaint()
             onProgressColorChanged: requestPaint()

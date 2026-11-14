@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import org.kde.plasma.components as PlasmaComponents3
+import "battery.js" as Battery
 
 Item {
     id: root
@@ -97,9 +98,7 @@ Item {
                     rotation: -90 // start from top
 
                     property real progress: Math.max(0, Math.min(100, averageBattery)) / 100
-                    property color progressColor: averageBattery < 20 ? "#F44336"
-                                                : averageBattery < 50 ? "#FF9800"
-                                                : "#4CAF50"
+                    property color progressColor: Battery.levelColor(averageBattery, false)
                     property color trackColor: Kirigami.ColorUtils.adjustColor(Kirigami.Theme.textColor, {"alpha": -200})
 
                     onProgressChanged: requestPaint()
