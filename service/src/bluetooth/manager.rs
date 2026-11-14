@@ -113,6 +113,7 @@ enum ManagerCommand {
    GetDeviceState(Address, oneshot::Sender<Option<AirPods>>),
    GetAllDeviceStates(oneshot::Sender<Vec<AirPods>>),
    CountDevices(oneshot::Sender<u32>),
+   Shutdown(oneshot::Sender<()>),
 }
 
 // === Main Manager ===
@@ -120,7 +121,8 @@ enum ManagerCommand {
 /// Main Bluetooth manager that handles device discovery and connections.
 ///
 /// This type provides a high-level interface for managing `AirPods` devices
-/// across all available Bluetooth adapters.
+/// across all available Bluetooth adapters. Clones share the same manager.
+#[derive(Clone)]
 pub struct BluetoothManager {
    inbox: mpsc::Sender<ManagerCommand>,
 }
@@ -132,12 +134,19 @@ impl BluetoothManager {
       battery_study: Option<BatteryStudy>,
    ) -> Result<Self> {
       let (command_tx, command_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-      tokio::spawn(
-         ManagerActor::new(config, event_tx, command_rx, battery_study)
-            .await
-            .run(),
-      );
+      let actor = ManagerActor::new(config, event_tx, command_rx, battery_study).await?;
+      tokio::spawn(actor.run());
       Ok(Self { inbox: command_tx })
+   }
+
+   /// Disconnects all devices and stops the manager.
+   ///
+   /// Returns once cleanup has finished, or immediately if the manager is already gone.
+   pub async fn shutdown(&self) {
+      let (tx, rx) = oneshot::channel();
+      if self.inbox.send(ManagerCommand::Shutdown(tx)).await.is_ok() {
+         let _ = rx.await;
+      }
    }
 
    pub async fn establish_aap(&self, address: Address) -> Result<()> {
@@ -211,6 +220,8 @@ struct ManagerActor {
    loopback_tx: mpsc::Sender<ManagerCommand>,
    session: Session,
    battery_study: Option<BatteryStudy>,
+   /// Answered once cleanup has finished after a shutdown request
+   shutdown_reply: Option<oneshot::Sender<()>>,
 
    // State
    adapters: HashMap<SmolStr, AdapterInfo>,
@@ -224,13 +235,11 @@ impl ManagerActor {
       event_tx: EventSender,
       command_rx: mpsc::Receiver<ManagerCommand>,
       battery_study: Option<BatteryStudy>,
-   ) -> Self {
-      let session = Session::new()
-         .await
-         .expect("Failed to create Bluetooth session");
+   ) -> Result<Self> {
+      let session = Session::new().await?;
 
       let (loopback_tx, loopback_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-      Self {
+      Ok(Self {
          config,
          event_tx,
          command_rx,
@@ -238,10 +247,11 @@ impl ManagerActor {
          loopback_tx,
          session,
          battery_study,
+         shutdown_reply: None,
          adapters: HashMap::new(),
          devices: HashMap::new(),
          aap_connecting: HashSet::new(),
-      }
+      })
    }
 
    async fn run(mut self) {
@@ -315,6 +325,9 @@ impl ManagerActor {
 
       // Cleanup
       self.cleanup().await;
+      if let Some(reply) = self.shutdown_reply.take() {
+         let _ = reply.send(());
+      }
    }
 
    async fn initialize_adapters(&mut self) {
@@ -533,6 +546,11 @@ impl ManagerActor {
          ManagerCommand::CountDevices(reply) => {
             let count = self.devices.len() as u32;
             let _ = reply.send(count);
+         },
+         ManagerCommand::Shutdown(reply) => {
+            info!("Bluetooth manager shutting down");
+            self.shutdown_reply = Some(reply);
+            return false;
          },
       }
       true

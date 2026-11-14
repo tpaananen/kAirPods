@@ -8,7 +8,12 @@ use std::{sync::Arc, time::Duration};
 
 use crossbeam::queue::SegQueue;
 use log::{info, warn};
-use tokio::{signal, sync::Notify, time};
+use tokio::{
+   select,
+   signal::{self, unix::SignalKind},
+   sync::Notify,
+   time,
+};
 use zbus::{Connection, connection, object_server::InterfaceRef};
 
 use bluetooth::manager::BluetoothManager;
@@ -29,6 +34,9 @@ mod ringbuf;
 use battery_provider::BluezBatteryManager;
 
 use crate::{airpods::device::AirPods, dbus::AirPodsServiceSignals, error::Result};
+
+/// Maximum time to wait for devices to disconnect and data to be saved on shutdown
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -96,7 +104,7 @@ async fn main() -> Result<()> {
    let bluetooth_manager = BluetoothManager::new(event_bus.clone(), config, battery_study).await?;
 
    // Create D-Bus service
-   let service = AirPodsService::new(bluetooth_manager);
+   let service = AirPodsService::new(bluetooth_manager.clone());
 
    // Build D-Bus connection
    let connection = connection::Builder::session()?
@@ -124,9 +132,27 @@ async fn main() -> Result<()> {
       .await?;
 
    // Wait for shutdown signal
-   signal::ctrl_c().await?;
+   shutdown_signal().await?;
    info!("Shutting down kAirPods service...");
 
+   // Disconnect devices and save battery study data before exiting
+   if time::timeout(SHUTDOWN_TIMEOUT, bluetooth_manager.shutdown())
+      .await
+      .is_err()
+   {
+      warn!("Bluetooth manager did not shut down within {SHUTDOWN_TIMEOUT:?}");
+   }
+
+   Ok(())
+}
+
+/// Waits for SIGINT (Ctrl-C) or SIGTERM (systemd stop, session logout).
+async fn shutdown_signal() -> Result<()> {
+   let mut sigterm = signal::unix::signal(SignalKind::terminate())?;
+   select! {
+      result = signal::ctrl_c() => result?,
+      _ = sigterm.recv() => {},
+   }
    Ok(())
 }
 
@@ -299,5 +325,33 @@ impl EventBus for EventProcessor {
    fn emit(&self, device: &AirPods, event: AirPodsEvent) {
       self.queue.push((device.clone(), event));
       self.notifier.notify_waiters();
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use std::{
+      pin::pin,
+      process::{self, Command},
+   };
+
+   use super::*;
+
+   #[tokio::test]
+   async fn sigterm_ends_shutdown_wait() {
+      let mut wait = pin!(shutdown_signal());
+      // The first poll installs the signal handlers; without them SIGTERM would kill the test
+      assert!(futures::poll!(wait.as_mut()).is_pending());
+
+      let status = Command::new("kill")
+         .args(["-TERM", &process::id().to_string()])
+         .status()
+         .unwrap();
+      assert!(status.success());
+
+      time::timeout(Duration::from_secs(5), wait)
+         .await
+         .expect("SIGTERM should end the wait")
+         .unwrap();
    }
 }
