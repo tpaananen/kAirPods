@@ -7,7 +7,7 @@
 use uuid::Uuid;
 
 /// Patterns to match `AirPods` devices (case-insensitive)
-const AIRPOD_PATTERNS: &[&str] = &["airpods", "beats", "powerbeats"];
+const AIRPOD_PATTERNS: &[&str] = &["airpods", "beats"];
 // Note: "earpods" are wired earphones, not Bluetooth AirPods
 
 /// Apple vendor ID
@@ -65,10 +65,17 @@ impl NoiseCapabilities {
    }
 }
 
+/// Whether a modalias names an Apple product.
+///
+/// Only Bluetooth vendor IDs are Apple's at 0x004C; USB uses another numbering.
+fn is_apple(modalias: &bluer::Modalias) -> bool {
+   modalias.source == "bluetooth" && modalias.vendor == APPLE_VID
+}
+
 /// Returns the Apple Bluetooth product ID when available.
 pub async fn product_id(dev: &bluer::Device) -> Option<u32> {
    if let Ok(Some(modalias)) = dev.modalias().await
-      && modalias.vendor == APPLE_VID
+      && is_apple(&modalias)
    {
       return Some(modalias.product);
    }
@@ -99,16 +106,20 @@ fn manufacturer_product_id(data: &[u8]) -> Option<u32> {
 
 pub async fn is_device_airpods(dev: &bluer::Device) -> bool {
    // 1. Check modalias (most reliable for connected devices)
-   if let Ok(Some(modalias)) = dev.modalias().await
-      && modalias.vendor == APPLE_VID
-      && AIRPOD_PIDS.contains(&modalias.product)
-   {
-      log::debug!(
-         "AirPods detected via modalias: vendor={:#06x}, product={:#06x}",
-         modalias.vendor,
-         modalias.product
-      );
-      return true;
+   if let Ok(Some(modalias)) = dev.modalias().await {
+      if !is_apple(&modalias) {
+         // Another vendor's product is never AirPods, whatever its name or services
+         return false;
+      }
+      if AIRPOD_PIDS.contains(&modalias.product) {
+         log::debug!(
+            "AirPods detected via modalias: vendor={:#06x}, product={:#06x}",
+            modalias.vendor,
+            modalias.product
+         );
+         return true;
+      }
+      // An Apple product not listed yet: the checks below may still recognize it
    }
 
    // 2. Check manufacturer data (useful for advertising/unconnected devices)
@@ -152,13 +163,23 @@ pub async fn is_device_airpods(dev: &bluer::Device) -> bool {
 
 #[cfg(test)]
 mod tests {
-   use super::{NoiseCapabilities, manufacturer_product_id};
+   use super::{NoiseCapabilities, is_apple, manufacturer_product_id};
 
    #[test]
    fn reads_proximity_product_id_not_battery() {
       let data = [0x07, 0x19, 0x01, 0x0a, 0x20, 0x00, 0x13];
       assert_eq!(manufacturer_product_id(&data), Some(0x200A));
       assert_eq!(manufacturer_product_id(&data[..4]), None);
+   }
+
+   #[test]
+   fn only_bluetooth_vendor_0x004c_is_apple() {
+      let modalias = |s: &str| s.parse::<bluer::Modalias>().unwrap();
+      // AirPods Pro 2 (USB-C)
+      assert!(is_apple(&modalias("bluetooth:v004Cp2024d242F")));
+      // Another vendor, and 0x004C in the USB numbering
+      assert!(!is_apple(&modalias("bluetooth:v000Fp1200d1436")));
+      assert!(!is_apple(&modalias("usb:v004Cp2024d242F")));
    }
 
    #[test]
