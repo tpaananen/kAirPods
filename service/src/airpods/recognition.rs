@@ -88,12 +88,8 @@ pub async fn product_id(dev: &bluer::Device) -> Option<u32> {
    None
 }
 
-/// Apple service UUIDs - Note: Not always advertised by AirPods
-static APPLE_SERVICES: [Uuid; 3] = [
-   Uuid::from_u128(0x0000fd6f_0000_1000_8000_00805f9b34fb), // Find My
-   Uuid::from_u128(0x0000fd39_0000_1000_8000_00805f9b34fb), // Apple service
-   Uuid::from_u128(0x0000fd32_0000_1000_8000_00805f9b34fb), // Apple service
-];
+/// Service of the Apple Accessory Protocol, which AirPods list once paired
+const AAP_SERVICE: Uuid = Uuid::from_u128(0x74ec2172_0bad_4d01_8f77_997b2be0722a);
 
 /// Extract the product ID from an Apple proximity-pairing message.
 fn manufacturer_product_id(data: &[u8]) -> Option<u32> {
@@ -131,11 +127,11 @@ pub async fn is_device_airpods(dev: &bluer::Device) -> bool {
       return true;
    }
 
-   // 3. Check service UUIDs (not always present, but definitive when found)
+   // 3. Check for the AAP service, the protocol this service speaks
    if let Ok(Some(uuids)) = dev.uuids().await
-      && uuids.iter().any(|u| APPLE_SERVICES.contains(u))
+      && uuids.contains(&AAP_SERVICE)
    {
-      log::debug!("AirPods detected via Apple service UUID");
+      log::debug!("AirPods detected via AAP service UUID");
       return true;
    }
 

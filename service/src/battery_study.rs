@@ -419,9 +419,11 @@ impl BatteryStudy {
             return Ok(None);
          }
 
-         // Calculate 95% confidence interval
+         // Calculate 95% confidence interval. A variance of exactly zero means the rate
+         // comes from a single save: there is no spread to measure, so nothing is known
+         // about how reliable it is.
          let samples = stats.samples.min(MAX_STUDY_SAMPLES);
-         let confidence = if samples > 1 {
+         let confidence = if samples > 1 && stats.variance > 0.0 {
             1.96 * (stats.variance / f64::from(samples)).sqrt()
          } else {
             f64::INFINITY
@@ -1003,7 +1005,8 @@ mod tests {
          .get_drain_rate(TEST_ADDRESS, NoiseControlMode::Active)?
          .unwrap();
       assert!((rate - 12.5).abs() < 0.001);
-      assert_eq!(confidence, 0.0); // First update has zero variance
+      // A single save says nothing about the spread
+      assert_eq!(confidence, f64::INFINITY);
 
       // Add another sample
       manager.update_drain_rate(TEST_ADDRESS, NoiseControlMode::Active, 11.5, 10)?;
@@ -1288,7 +1291,7 @@ mod tests {
       let (_, confidence) = study
          .get_drain_rate(TEST_ADDRESS, NoiseControlMode::Active)?
          .unwrap();
-      assert_eq!(confidence, 0.0); // Single update, no variance yet
+      assert_eq!(confidence, f64::INFINITY); // Single update, no variance yet
 
       // New data with the weight of the cap moves the mean halfway
       study.update_drain_rate(
@@ -1360,6 +1363,18 @@ mod tests {
             .is_none()
       );
       Ok(())
+   }
+
+   #[test]
+   fn test_single_save_does_not_outweigh_local_samples() {
+      let local = Some((20.0, 0.3));
+      let combine = |hist_conf: f64| {
+         BatteryTracker::combine_drain_rates(local, Some((10.0, hist_conf)), 6)
+            .unwrap()
+            .0
+      };
+      // Unknown confidence leans on the live samples more than a measured, tight one
+      assert!(combine(f64::INFINITY) > combine(0.5));
    }
 
    #[test]
