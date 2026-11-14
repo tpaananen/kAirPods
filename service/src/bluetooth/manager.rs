@@ -48,10 +48,18 @@ const CHANNEL_BUFFER_SIZE: usize = 1000;
 
 // === Adapter Management ===
 
+/// What the manager knows about an adapter, and whether devices on it can use AAP.
 #[derive(Debug, Clone, PartialEq)]
 enum AdapterState {
+   /// Powered and set up: its devices are monitored and AAP connections may be made
    Active,
+   /// Turned off by the user or the system; it is left off until powered on
+   PoweredOff,
+   /// Its event stream ended, typically because `BlueZ` removed it; set up again after a
+   /// backoff, or as soon as it reports a power-on
    Lost,
+   /// Setting it up failed (reading its power state or watching its events); retried
+   /// after a backoff. Holds the error for the log.
    Failed(String),
 }
 
@@ -160,6 +168,7 @@ impl ManagedDevice {
 enum ManagerCommand {
    // Adapter events
    AdapterPowered(SmolStr),
+   AdapterPoweredOff(SmolStr),
    AdapterLost(SmolStr),
    AdapterError(SmolStr, String), // adapter_name, error
 
@@ -456,17 +465,36 @@ impl ManagerActor {
             info.adapter.clone(),
          ));
       }
-      let result = match info.adapter.is_powered().await {
-         Ok(true) => Ok(()),
-         Ok(false) => info.adapter.set_powered(true).await,
-         Err(e) => Err(e),
-      };
-      if let Err(e) = result {
-         self.schedule_adapter_retry(&name, format!("Failed to power on adapter {name}: {e}"));
-         return;
+      // Bluetooth turned off is a choice of the user or the system: wait for it to be
+      // powered on instead of overriding it. The adapter monitor reports the power-on.
+      match info.adapter.is_powered().await {
+         Ok(true) => {},
+         Ok(false) => {
+            Self::mark_powered_off(info);
+            return;
+         },
+         Err(e) => {
+            self.schedule_adapter_retry(
+               &name,
+               format!("Failed to read power of adapter {name}: {e}"),
+            );
+            return;
+         },
       }
 
       self.handle_adapter_available(name).await;
+   }
+
+   fn mark_powered_off(info: &mut AdapterInfo) {
+      if info.state != AdapterState::PoweredOff {
+         info!(
+            "Adapter {} is powered off, waiting for it to be powered on",
+            info.name
+         );
+      }
+      info.state = AdapterState::PoweredOff;
+      info.retry_count = 0;
+      info.next_retry = None;
    }
 
    fn schedule_adapter_retry(&mut self, name: &SmolStr, error: String) {
@@ -501,6 +529,17 @@ impl ManagerActor {
             return;
          };
 
+         // Report an adapter that is already powered: a power-on between the caller's
+         // check and this subscription would otherwise go unnoticed
+         if adapter.is_powered().await == Ok(true)
+            && loopback
+               .send(ManagerCommand::AdapterPowered(name.clone()))
+               .await
+               .is_err()
+         {
+            return;
+         }
+
          while let Some(event) = events.next().await {
             match event {
                AdapterEvent::DeviceAdded(addr) => {
@@ -515,10 +554,13 @@ impl ManagerActor {
                      .send(ManagerCommand::DeviceLost(addr, name.clone()))
                      .await;
                },
-               AdapterEvent::PropertyChanged(AdapterProperty::Powered(true)) => {
-                  let _ = loopback
-                     .send(ManagerCommand::AdapterPowered(name.clone()))
-                     .await;
+               AdapterEvent::PropertyChanged(AdapterProperty::Powered(powered)) => {
+                  let command = if powered {
+                     ManagerCommand::AdapterPowered(name.clone())
+                  } else {
+                     ManagerCommand::AdapterPoweredOff(name.clone())
+                  };
+                  let _ = loopback.send(command).await;
                },
                // Connection changes are reported by the device monitors
                _ => {},
@@ -637,13 +679,10 @@ impl ManagerActor {
    async fn handle_command(&mut self, cmd: ManagerCommand) -> bool {
       match cmd {
          ManagerCommand::AdapterPowered(name) => {
-            if self
-               .adapters
-               .get(&name)
-               .is_some_and(|info| info.state != AdapterState::Active)
-            {
-               self.initialize_adapter(name).await;
-            }
+            self.handle_adapter_powered(name).await;
+         },
+         ManagerCommand::AdapterPoweredOff(name) => {
+            self.handle_adapter_powered_off(&name);
          },
          ManagerCommand::AdapterLost(name) => {
             self.handle_adapter_lost(name).await;
@@ -676,43 +715,76 @@ impl ManagerActor {
             self.handle_device_lost(addr, adapter_name).await;
          },
          ManagerCommand::EstablishAAP(addr, reply) => {
-            // An explicit request lifts an earlier user disconnect
-            if let Some(device) = self.devices.get_mut(&addr) {
-               device.user_disconnected = false;
-            }
-            let result = self.establish_aap_connection(addr).await;
-            let _ = reply.send(result);
+            self.handle_establish_aap(addr, reply).await;
          },
          ManagerCommand::DisconnectAAP(addr, reply) => {
-            let result = self.disconnect_aap(addr).await;
-            if let Some(reply) = reply {
-               let _ = reply.send(result);
-            }
+            self.handle_disconnect_aap(addr, reply).await;
          },
          ManagerCommand::GetDeviceState(addr, reply) => {
-            let state = self.devices.get(&addr).map(|d| d.device.clone());
-            let _ = reply.send(state);
+            self.handle_get_device_state(addr, reply);
          },
          ManagerCommand::GetAllDeviceStates(reply) => {
-            let states = self.devices.values().map(|d| d.device.clone()).collect();
-            let _ = reply.send(states);
+            self.handle_get_all_device_states(reply);
          },
          ManagerCommand::CountConnectedDevices(reply) => {
-            // Same notion of "connected" as the device JSON
-            let count = self
-               .devices
-               .values()
-               .filter(|d| d.device.is_connected())
-               .count() as u32;
-            let _ = reply.send(count);
+            self.handle_count_connected_devices(reply);
          },
          ManagerCommand::Shutdown(reply) => {
-            info!("Bluetooth manager shutting down");
-            self.shutdown_reply = Some(reply);
+            self.handle_shutdown(reply);
             return false;
          },
       }
       true
+   }
+
+   // === User commands ===
+
+   /// Connects AAP on request. An explicit request lifts an earlier user disconnect.
+   async fn handle_establish_aap(&mut self, addr: Address, reply: oneshot::Sender<Result<()>>) {
+      if let Some(device) = self.devices.get_mut(&addr) {
+         device.user_disconnected = false;
+      }
+      let result = self.establish_aap_connection(addr).await;
+      let _ = reply.send(result);
+   }
+
+   /// Disconnects AAP on request, answering if the caller waits for the result.
+   async fn handle_disconnect_aap(
+      &mut self,
+      addr: Address,
+      reply: Option<oneshot::Sender<Result<()>>>,
+   ) {
+      let result = self.disconnect_aap(addr).await;
+      if let Some(reply) = reply {
+         let _ = reply.send(result);
+      }
+   }
+
+   fn handle_get_device_state(&self, addr: Address, reply: oneshot::Sender<Option<AirPods>>) {
+      let state = self.devices.get(&addr).map(|d| d.device.clone());
+      let _ = reply.send(state);
+   }
+
+   fn handle_get_all_device_states(&self, reply: oneshot::Sender<Vec<AirPods>>) {
+      let states = self.devices.values().map(|d| d.device.clone()).collect();
+      let _ = reply.send(states);
+   }
+
+   /// Counts devices with an AAP connection: the same notion of "connected" as the
+   /// device JSON.
+   fn handle_count_connected_devices(&self, reply: oneshot::Sender<u32>) {
+      let count = self
+         .devices
+         .values()
+         .filter(|d| d.device.is_connected())
+         .count() as u32;
+      let _ = reply.send(count);
+   }
+
+   /// Records who to answer once cleanup has finished. The caller then ends the loop.
+   fn handle_shutdown(&mut self, reply: oneshot::Sender<()>) {
+      info!("Bluetooth manager shutting down");
+      self.shutdown_reply = Some(reply);
    }
 
    async fn handle_adapter_available(&mut self, name: SmolStr) {
@@ -777,6 +849,33 @@ impl ManagerActor {
                .event_tx
                .emit(&device.device, AirPodsEvent::DeviceError);
          }
+      }
+   }
+
+   /// Handles an adapter that reported it is powered.
+   ///
+   /// Sets it up unless it is already active: the adapter monitor also reports an adapter
+   /// that was powered when it subscribed, which is usually one already set up.
+   async fn handle_adapter_powered(&mut self, name: SmolStr) {
+      if self
+         .adapters
+         .get(&name)
+         .is_some_and(|info| info.state != AdapterState::Active)
+      {
+         self.initialize_adapter(name).await;
+      }
+   }
+
+   /// Handles an adapter that was turned off while in use.
+   ///
+   /// Its links drop with it; the device monitors report those disconnects. Adapters in
+   /// any other state are left alone: they are not in use, and a lost or failed one is
+   /// checked again on its next setup attempt.
+   fn handle_adapter_powered_off(&mut self, name: &SmolStr) {
+      if let Some(info) = self.adapters.get_mut(name)
+         && info.state == AdapterState::Active
+      {
+         Self::mark_powered_off(info);
       }
    }
 
