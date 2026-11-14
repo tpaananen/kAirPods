@@ -260,7 +260,7 @@ impl EventProcessor {
          },
          AirPodsEvent::EarDetectionChanged {
             status: ear_detection,
-            first_report,
+            previous,
          } => {
             iface
                .ear_detection_changed(addr_str, &ear_detection.to_json().to_string())
@@ -272,18 +272,11 @@ impl EventProcessor {
                .devices_changed(iface.signal_emitter())
                .await?;
 
-            // Handle play/pause based on ear detection
-            // Pause when at least one earbud is removed, play only when both are in.
-            // Connecting alone must not touch playback, so the first report is skipped.
-            let both_in_ear = ear_detection.is_left_in_ear() && ear_detection.is_right_in_ear();
-            if first_report {
+            // Pause when a bud leaves an ear, resume when one goes back in
+            if previous.is_none() {
                debug!("Initial ear detection state for {addr_str}, leaving playback alone");
-            } else if both_in_ear {
-               // Both AirPods are in ear - send play command
-               media.play();
-            } else {
-               // At least one AirPod is out of ear - send pause command
-               media.pause();
+            } else if let Some(action) = media_control::playback_action(previous, ear_detection) {
+               media.apply(action);
             }
          },
          AirPodsEvent::DeviceError => {

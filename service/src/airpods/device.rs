@@ -197,12 +197,9 @@ impl AirPods {
       self.0.ear_detection.load()
    }
 
-   /// Sets the ear detection status of the Airpod.
-   pub fn update_ear_detection(
-      &self,
-      status: impl Into<Option<EarDetectionStatus>>,
-   ) -> UpdateOp<EarDetectionStatus> {
-      UpdateOp::apply_atomic(&self.0.ear_detection, status.into())
+   /// Sets the ear detection status of the Airpod and returns the previous one.
+   pub fn update_ear_detection(&self, status: EarDetectionStatus) -> Option<EarDetectionStatus> {
+      self.0.ear_detection.swap(Some(status))
    }
 
    /// Gets the noise control mode of the Airpod.
@@ -588,15 +585,9 @@ impl AirPods {
                   status.is_right_in_case()
                );
 
-               let update = self.update_ear_detection(status);
-               if update.is_updated() {
-                  event_tx.emit(
-                     self,
-                     AirPodsEvent::EarDetectionChanged {
-                        status,
-                        first_report: matches!(update, UpdateOp::Inserted),
-                     },
-                  );
+               let previous = self.update_ear_detection(status);
+               if previous != Some(status) {
+                  event_tx.emit(self, AirPodsEvent::EarDetectionChanged { status, previous });
                }
             },
             Err(e) => warn!("Failed to parse ear detection: {e}"),
@@ -828,7 +819,7 @@ mod tests {
             .lock()
             .drain(..)
             .map(|event| match event {
-               AirPodsEvent::EarDetectionChanged { first_report, .. } => first_report,
+               AirPodsEvent::EarDetectionChanged { previous, .. } => previous.is_none(),
                other => panic!("unexpected event {other:?}"),
             })
             .collect()

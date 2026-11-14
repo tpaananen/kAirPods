@@ -21,8 +21,9 @@ pub enum AirPodsEvent {
    NoiseControlChanged(NoiseControlMode),
    EarDetectionChanged {
       status: EarDetectionStatus,
-      /// First report of a connection: the state became known, nothing changed in the ears
-      first_report: bool,
+      /// Status before this report; `None` for the first report of a connection, when the
+      /// state became known but nothing changed in the ears
+      previous: Option<EarDetectionStatus>,
    },
 }
 

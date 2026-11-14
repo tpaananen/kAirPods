@@ -13,6 +13,8 @@ use parking_lot::Mutex;
 use tokio::{sync::mpsc, time};
 use zbus::Connection;
 
+use crate::airpods::protocol::EarDetectionStatus;
+
 /// Maximum time to wait for a reply from the bus or a media player.
 ///
 /// zbus has no timeout of its own, so a frozen player would otherwise never answer.
@@ -37,6 +39,33 @@ pub fn is_enabled() -> bool {
 enum Command {
    Play,
    Pause,
+}
+
+/// What an ear detection change does to playback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackAction {
+   Play,
+   Pause,
+}
+
+/// Decides the playback change for an ear detection report.
+///
+/// Follows the number of earbuds in an ear: taking one out pauses, putting one in
+/// resumes. Moves between hand and case do not change that number and are ignored, so
+/// one-bud listening is not paused by the other bud going into the case. The first report
+/// of a connection (`previous` is `None`) leaves playback alone: connecting changes
+/// nothing in the ears.
+pub fn playback_action(
+   previous: Option<EarDetectionStatus>,
+   status: EarDetectionStatus,
+) -> Option<PlaybackAction> {
+   let before = previous?.in_ear_count();
+   let now = status.in_ear_count();
+   match now.cmp(&before) {
+      std::cmp::Ordering::Less => Some(PlaybackAction::Pause),
+      std::cmp::Ordering::Greater => Some(PlaybackAction::Play),
+      std::cmp::Ordering::Equal => None,
+   }
 }
 
 /// Pauses and resumes media players on a task of its own.
@@ -70,6 +99,14 @@ impl MediaControl {
    /// Pauses all playing media players.
    pub fn pause(&self) {
       let _ = self.tx.send(Command::Pause);
+   }
+
+   /// Requests the playback change decided by [`playback_action`].
+   pub fn apply(&self, action: PlaybackAction) {
+      match action {
+         PlaybackAction::Play => self.play(),
+         PlaybackAction::Pause => self.pause(),
+      }
    }
 }
 
@@ -259,4 +296,62 @@ async fn send_mpris_command_to_player(
    .await??;
 
    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use crate::airpods::protocol::PodPlacement::{InCase, InEar, OutOfEar};
+
+   fn status(
+      left: crate::airpods::protocol::PodPlacement,
+      right: crate::airpods::protocol::PodPlacement,
+   ) -> EarDetectionStatus {
+      EarDetectionStatus::new(left, right)
+   }
+
+   #[test]
+   fn first_report_leaves_playback_alone() {
+      assert_eq!(playback_action(None, status(InEar, InEar)), None);
+      assert_eq!(playback_action(None, status(OutOfEar, InCase)), None);
+   }
+
+   #[test]
+   fn taking_a_bud_out_pauses() {
+      let both = status(InEar, InEar);
+      assert_eq!(
+         playback_action(Some(both), status(OutOfEar, InEar)),
+         Some(PlaybackAction::Pause)
+      );
+      let one = status(InEar, OutOfEar);
+      assert_eq!(
+         playback_action(Some(one), status(OutOfEar, OutOfEar)),
+         Some(PlaybackAction::Pause)
+      );
+   }
+
+   #[test]
+   fn putting_a_bud_in_resumes() {
+      // One-bud listening: the bud comes back
+      assert_eq!(
+         playback_action(Some(status(OutOfEar, InCase)), status(InEar, InCase)),
+         Some(PlaybackAction::Play)
+      );
+      assert_eq!(
+         playback_action(Some(status(InEar, OutOfEar)), status(InEar, InEar)),
+         Some(PlaybackAction::Play)
+      );
+   }
+
+   #[test]
+   fn moving_the_other_bud_to_the_case_is_ignored() {
+      assert_eq!(
+         playback_action(Some(status(InEar, OutOfEar)), status(InEar, InCase)),
+         None
+      );
+      assert_eq!(
+         playback_action(Some(status(InEar, InCase)), status(InEar, OutOfEar)),
+         None
+      );
+   }
 }

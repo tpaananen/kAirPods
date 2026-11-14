@@ -546,6 +546,11 @@ impl EarDetectionStatus {
       self.0.get() & Self::RIGHT_IN_CASE != 0
    }
 
+   /// Number of earbuds in an ear: 0, 1 or 2.
+   pub const fn in_ear_count(&self) -> u8 {
+      self.is_left_in_ear() as u8 + self.is_right_in_ear() as u8
+   }
+
    pub fn to_json(self) -> serde_json::Value {
       json!({
           "left_in_ear": self.is_left_in_ear(),
