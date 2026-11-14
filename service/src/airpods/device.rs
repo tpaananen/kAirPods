@@ -80,6 +80,8 @@ struct AirPodsInner {
    conn: RwLock<Option<ConnectionState>>,
    next_conn_id: AtomicU64,
    battery_tracker: parking_lot::Mutex<BatteryTracker>,
+   /// Battery study writes running on the blocking pool, so shutdown can wait for them
+   battery_writes: parking_lot::Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// Represents a connected `AirPods` device.
@@ -313,11 +315,11 @@ impl AirPods {
       self.0.is_connected.store(true, Ordering::Relaxed);
 
       // Initialize battery study session
-      self
-         .0
-         .battery_tracker
-         .lock()
-         .init_session(self.address(), self.name());
+      let study = self.0.battery_tracker.lock().study().cloned();
+      if let Some(study) = study {
+         let (address, name) = (self.address(), self.name().clone());
+         self.spawn_battery_write(move || study.init_session(address, &name));
+      }
 
       info!("Successfully connected to {}", self.address());
       Ok(jhandle)
@@ -706,13 +708,38 @@ impl AirPods {
    }
 
    /// Saves the battery study data of the connection that ended and forgets it.
+   ///
+   /// The history is cleared at once, so a reconnect starts afresh; the database write
+   /// waits for the disk, so it runs on the blocking pool instead of holding up the
+   /// caller, which is often the manager.
    fn end_battery_session(&self) {
       let mode = self.noise_mode().unwrap_or_default();
-      self
+      let pending = self
          .0
          .battery_tracker
          .lock()
-         .end_session(self.address(), mode);
+         .take_session(self.address(), mode);
+      if let Some(pending) = pending {
+         self.spawn_battery_write(move || {
+            pending.write();
+         });
+      }
+   }
+
+   /// Runs a battery study write on the blocking pool and keeps track of it.
+   fn spawn_battery_write(&self, write: impl FnOnce() + Send + 'static) {
+      let mut writes = self.0.battery_writes.lock();
+      writes.retain(|write| !write.is_finished());
+      writes.push(tokio::task::spawn_blocking(write));
+   }
+
+   /// Waits for the battery study writes started so far, such as the save of the session
+   /// that a disconnect ended.
+   pub async fn flush_battery_writes(&self) {
+      let writes = std::mem::take(&mut *self.0.battery_writes.lock());
+      for write in writes {
+         let _ = write.await;
+      }
    }
 
    /// Checks if enough time has passed and samples collected to warrant a periodic save.
@@ -948,6 +975,37 @@ mod tests {
       // An unchanged primary maps nothing again
       battery_with_primary(Component::Right, Component::Left);
       assert!(ear_events().is_empty());
+   }
+
+   #[tokio::test]
+   async fn disconnect_does_not_wait_for_the_battery_study() {
+      let (study, _dir) = BatteryStudy::open_temp();
+      study
+         .get_or_create_study(Address::default(), "test".into())
+         .unwrap();
+      let device = AirPods::new(Address::default(), "test".into(), None, Some(study.clone()));
+      device.0.battery_tracker.lock().record_test_drops(6);
+      set_connection(&device, 1).await;
+
+      // Another writer holds the database, as a slow disk would
+      let writer = study.hold_write_lock(Duration::from_millis(500));
+      let started = std::time::Instant::now();
+      assert!(device.disconnect().await);
+      let waited = started.elapsed();
+      assert!(
+         waited < Duration::from_millis(250),
+         "disconnect waited {waited:?}"
+      );
+      writer.join().unwrap();
+
+      // The session is still saved, once the database is free
+      device.flush_battery_writes().await;
+      assert!(
+         study
+            .get_drain_rate(Address::default(), NoiseControlMode::Off)
+            .unwrap()
+            .is_some()
+      );
    }
 
    #[tokio::test]

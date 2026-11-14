@@ -429,6 +429,29 @@ impl BatteryStudy {
       }
    }
 
+   /// Records the start of a session for a device. Writes to the database, so it may
+   /// wait for the disk.
+   pub fn init_session(&self, address: Address, device_name: &SmolStr) {
+      debug!("Initializing battery study session for {address} ({device_name})");
+      if let Err(e) = self.increment_session_count(address) {
+         debug!("Failed to increment session count: {e}");
+      }
+      match self.get_or_create_study(address, device_name.clone()) {
+         Ok(device_study) => {
+            debug!(
+               "Battery study for {}: {} sessions, {} samples, {} modes tracked",
+               address,
+               device_study.total_sessions,
+               device_study.total_samples,
+               device_study.drain_rates.len()
+            );
+         },
+         Err(e) => {
+            debug!("Failed to get/create battery study: {e}");
+         },
+      }
+   }
+
    /// Increment session count for a device
    pub fn increment_session_count(&self, address: Address) -> Result<()> {
       let mut wtxn = self.db.env.write_txn().map_err(Error::Transaction)?;
@@ -455,6 +478,43 @@ impl BatteryStudy {
    }
 }
 
+/// Drain data recorded since the last save, to be written with [`PendingSave::write`].
+#[derive(Debug)]
+pub struct PendingSave {
+   study: BatteryStudy,
+   address: Address,
+   noise_mode: NoiseControlMode,
+   drain_rate: f64,
+   new_samples: u32,
+}
+
+impl PendingSave {
+   /// Writes the drain data to the study database. May wait for the disk.
+   ///
+   /// Returns whether it was saved.
+   pub fn write(self) -> bool {
+      let Self {
+         study,
+         address,
+         noise_mode,
+         drain_rate,
+         new_samples,
+      } = self;
+      match study.update_drain_rate(address, noise_mode, drain_rate, new_samples) {
+         Ok(()) => {
+            debug!(
+               "Saved battery drain rate of {drain_rate:.1}%/hr for mode {noise_mode} with {new_samples} new samples"
+            );
+            true
+         },
+         Err(e) => {
+            warn!("Failed to save battery drain rate for {address}: {e}");
+            false
+         },
+      }
+   }
+}
+
 /// Battery tracker that manages real-time battery monitoring and integrates with long-term study.
 #[derive(Debug, Default)]
 pub struct BatteryTracker {
@@ -478,30 +538,9 @@ impl BatteryTracker {
       }
    }
 
-   /// Initializes a new battery study session for a device.
-   pub fn init_session(&self, address: Address, device_name: &SmolStr) {
-      if let Some(study) = &self.study {
-         debug!("Initializing battery study session for {address} ({device_name})");
-         if let Err(e) = study.increment_session_count(address) {
-            debug!("Failed to increment session count: {e}");
-         }
-         match study.get_or_create_study(address, device_name.clone()) {
-            Ok(device_study) => {
-               debug!(
-                  "Battery study for {}: {} sessions, {} samples, {} modes tracked",
-                  address,
-                  device_study.total_sessions,
-                  device_study.total_samples,
-                  device_study.drain_rates.len()
-               );
-            },
-            Err(e) => {
-               debug!("Failed to get/create battery study: {e}");
-            },
-         }
-      } else {
-         debug!("No battery study available for session initialization");
-      }
+   /// The study database this tracker saves to, if any.
+   pub const fn study(&self) -> Option<&BatteryStudy> {
+      self.study.as_ref()
    }
 
    /// Records battery levels for both buds, tracking drops for drain rate calculation.
@@ -831,44 +870,96 @@ impl BatteryTracker {
    /// Each sample is counted once: the drain rate is weighted by the samples recorded
    /// since the last save, and nothing is written when there are none.
    pub fn save_to_study(&mut self, address: Address, noise_mode: NoiseControlMode) {
-      let new_samples = self.unsaved_samples();
-      if new_samples > 0
-         && let Some(study) = &self.study
-         // Calculate drain rate from current session
-         && let Some((drain_rate, _alpha, sample_count)) = self.calculate_local_drain_rate()
-         && sample_count >= 4
-      {
+      if let Some(pending) = self.pending_save(address, noise_mode) {
          self.last_save = Some(Instant::now());
+         if pending.write() {
+            // Clear cache for this mode to force refresh
+            self.historical_cache.lock().remove(noise_mode);
 
-         // Update drain rate statistics in the database
-         match study.update_drain_rate(address, noise_mode, drain_rate, new_samples as u32) {
-            Ok(()) => {
-               debug!(
-                  "Saved battery drain rate of {drain_rate:.1}%/hr for mode {noise_mode} with {new_samples} new samples"
-               );
-
-               // Clear cache for this mode to force refresh
-               self.historical_cache.lock().remove(noise_mode);
-
-               self.left_history.unsaved = 0;
-               self.right_history.unsaved = 0;
-            },
-            Err(e) => warn!("Failed to save battery drain rate for {address}: {e}"),
+            self.left_history.unsaved = 0;
+            self.right_history.unsaved = 0;
          }
       }
    }
 
-   /// Saves the drain data of a connection that ended and starts the next one afresh.
+   /// The drain data recorded since the last save, if there is enough to save.
+   fn pending_save(&self, address: Address, noise_mode: NoiseControlMode) -> Option<PendingSave> {
+      let new_samples = self.unsaved_samples();
+      if new_samples == 0 {
+         return None;
+      }
+      let study = self.study.clone()?;
+      // Calculate drain rate from current session
+      let (drain_rate, _alpha, sample_count) = self.calculate_local_drain_rate()?;
+      (sample_count >= 4).then_some(PendingSave {
+         study,
+         address,
+         noise_mode,
+         drain_rate,
+         new_samples: new_samples as u32,
+      })
+   }
+
+   /// Ends the session of a connection: returns its unsaved drain data and starts the
+   /// next session afresh.
    ///
-   /// Samples from different connections must not be combined: the time in between,
-   /// such as a suspend, is not visible to the monotonic clock, so the levels lost in
-   /// that time would look like a sudden drain.
-   pub fn end_session(&mut self, address: Address, noise_mode: NoiseControlMode) {
-      self.save_to_study(address, noise_mode);
+   /// The caller writes the data, so it can do that off the async threads. Samples from
+   /// different connections must not be combined: the time in between, such as a
+   /// suspend, is not visible to the monotonic clock, so the levels lost in that time
+   /// would look like a sudden drain.
+   pub fn take_session(
+      &mut self,
+      address: Address,
+      noise_mode: NoiseControlMode,
+   ) -> Option<PendingSave> {
+      let pending = self.pending_save(address, noise_mode);
+      if pending.is_some() {
+         // The next estimate reads the stored rate again
+         self.historical_cache.lock().remove(noise_mode);
+      }
       self.left_history.clear();
       self.right_history.clear();
       self.last_drain_rate = None;
       self.last_save = None;
+      pending
+   }
+}
+
+#[cfg(test)]
+impl BatteryStudy {
+   /// Opens a study in a new temporary directory, removed when the guard is dropped.
+   pub(crate) fn open_temp() -> (Self, tempfile::TempDir) {
+      let dir = tempfile::TempDir::new().unwrap();
+      let study = Self::open_at(dir.path()).unwrap();
+      (study, dir)
+   }
+
+   /// Holds the database write lock on another thread for `duration`, as a slow writer
+   /// would. Returns once the lock is held.
+   pub(crate) fn hold_write_lock(&self, duration: Duration) -> std::thread::JoinHandle<()> {
+      let study = self.clone();
+      let (held_tx, held_rx) = std::sync::mpsc::channel();
+      let writer = std::thread::spawn(move || {
+         let wtxn = study.db.env.write_txn().unwrap();
+         held_tx.send(()).unwrap();
+         std::thread::sleep(duration);
+         drop(wtxn);
+      });
+      held_rx.recv().unwrap();
+      writer
+   }
+}
+
+#[cfg(test)]
+impl BatteryTracker {
+   /// Records `count` drops of 1% every 210 s on both buds, from 100%.
+   pub(crate) fn record_test_drops(&mut self, count: u64) {
+      let base_time = Instant::now();
+      for i in 0..count {
+         let timestamp = base_time + Duration::from_secs(i * 210);
+         self.left_history.push(timestamp, 100 - i as u8);
+         self.right_history.push(timestamp, 100 - i as u8);
+      }
    }
 }
 
@@ -1399,15 +1490,31 @@ mod tests {
       }
       tracker.last_drain_rate = Some(20.0);
 
-      tracker.end_session(TEST_ADDRESS, NoiseControlMode::Off);
+      let pending = tracker
+         .take_session(TEST_ADDRESS, NoiseControlMode::Off)
+         .expect("the session has drain data to save");
 
+      // The session is over in memory at once; the database is written only by write()
+      assert!(tracker.left_history.is_empty() && tracker.right_history.is_empty());
+      assert!(tracker.last_drain_rate.is_none() && tracker.last_save.is_none());
+      assert!(
+         study
+            .get_drain_rate(TEST_ADDRESS, NoiseControlMode::Off)?
+            .is_none()
+      );
+      assert!(pending.write());
       assert!(
          study
             .get_drain_rate(TEST_ADDRESS, NoiseControlMode::Off)?
             .is_some()
       );
-      assert!(tracker.left_history.is_empty() && tracker.right_history.is_empty());
-      assert!(tracker.last_drain_rate.is_none() && tracker.last_save.is_none());
+
+      // Nothing is left for a second save
+      assert!(
+         tracker
+            .take_session(TEST_ADDRESS, NoiseControlMode::Off)
+            .is_none()
+      );
 
       // After a suspend the next connection reports a much lower level: it starts a new
       // history instead of extending the old one into a sudden drop

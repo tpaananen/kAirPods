@@ -1237,6 +1237,8 @@ impl ManagerActor {
             let _ = timeout(Duration::from_secs(1), handle).await;
          }
          device.device.disconnect().await;
+         // The battery study of the session that just ended is written off this task
+         let _ = timeout(Duration::from_secs(1), device.device.flush_battery_writes()).await;
       }
    }
 
