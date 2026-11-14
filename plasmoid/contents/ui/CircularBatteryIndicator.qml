@@ -13,6 +13,8 @@ Item {
     property real size: Kirigami.Units.gridUnit * 3
     property bool inEar: true
     property bool showEarStatus: false
+    // Flags this earbud as the one lagging behind its pair (L/R drift)
+    property bool highlightLevel: false
 
     width: size
     height: size + Kirigami.Units.gridUnit * 0.8 // Extra space for bottom percentage
@@ -210,15 +212,30 @@ Item {
         height: width
         radius: width / 2
 
-        color: inEar ? "#4CAF50" : "#757575"
+        color: !inEar ? "#757575" : highlightLevel ? Battery.ORANGE : Battery.GREEN
+
+        Behavior on color {
+            ColorAnimation { duration: 300 }
+        }
         border.width: 2
         border.color: Kirigami.Theme.backgroundColor
 
         Kirigami.Icon {
             anchors.centerIn: parent
+            visible: !(inEar && highlightLevel)
             source: inEar ? "dialog-ok" : "dialog-cancel"
             width: parent.width * 0.6
             height: width
+            color: "white"
+        }
+
+        // Exclamation mark for the earbud lagging behind its pair
+        Text {
+            anchors.centerIn: parent
+            visible: inEar && highlightLevel
+            text: "!"
+            font.pixelSize: parent.width * 0.75
+            font.weight: Font.Black
             color: "white"
         }
 
@@ -238,9 +255,9 @@ Item {
         anchors.bottomMargin: size * -0.2
         text: i18nc("Battery level; %1 is a percentage", "%1%", level)
         font.pixelSize: size * 0.32
-        font.weight: Font.Normal
-        opacity: 0.6
-        color: Kirigami.Theme.textColor
+        font.weight: highlightLevel ? Font.Medium : Font.Normal
+        opacity: highlightLevel ? 1.0 : 0.6
+        color: highlightLevel ? Battery.ORANGE : Kirigami.Theme.textColor
         horizontalAlignment: Text.AlignHCenter
 
         Behavior on color {

@@ -31,6 +31,10 @@ Item {
                                  : 0
     property int lowestBattery: batteryLevels.length ? Math.min(...batteryLevels) : -1
 
+    // L/R earbud drift: the ring then shows the gap as an orange band
+    readonly property int lrDrift: device?.connected ? Battery.drift(device.battery) : 0
+    readonly property bool lrDrifting: lrDrift >= Battery.DRIFT_LEVEL
+
     MouseArea {
         id: mouseArea
         anchors.fill: parent
@@ -97,11 +101,17 @@ Item {
                     height: width
                     rotation: -90 // start from top
 
-                    property real progress: Math.max(0, Math.min(100, averageBattery)) / 100
-                    property color progressColor: Battery.levelColor(averageBattery, false)
+                    // While drifting, the main arc runs to the lower earbud and an
+                    // orange band (bandEnd) covers the gap up to the higher one.
+                    readonly property int arcLevel: lrDrifting ? lowestBattery : averageBattery
+                    readonly property int bandLevel: lrDrifting ? Math.max(...batteryLevels) : arcLevel
+                    property real progress: Math.max(0, Math.min(100, arcLevel)) / 100
+                    property real bandEnd: Math.max(0, Math.min(100, bandLevel)) / 100
+                    property color progressColor: Battery.levelColor(arcLevel, false)
                     property color trackColor: Kirigami.ColorUtils.adjustColor(Kirigami.Theme.textColor, {"alpha": -200})
 
                     onProgressChanged: requestPaint()
+                    onBandEndChanged: requestPaint()
                     onProgressColorChanged: requestPaint()
                     onTrackColorChanged: requestPaint()
                     onWidthChanged: requestPaint()
@@ -125,9 +135,19 @@ Item {
                             ctx.strokeStyle = progressColor
                             ctx.stroke()
                         }
+
+                        if (bandEnd > progress) {
+                            ctx.beginPath()
+                            ctx.arc(c, c, r, 2 * Math.PI * progress, 2 * Math.PI * bandEnd)
+                            ctx.strokeStyle = Battery.ORANGE
+                            ctx.stroke()
+                        }
                     }
 
                     Behavior on progress {
+                        NumberAnimation { duration: 800; easing.type: Easing.InOutCubic }
+                    }
+                    Behavior on bandEnd {
                         NumberAnimation { duration: 800; easing.type: Easing.InOutCubic }
                     }
                 }
