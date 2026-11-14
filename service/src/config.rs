@@ -5,6 +5,7 @@
 
 use std::{env, fs, path::PathBuf};
 
+use bluer::Address;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
@@ -88,13 +89,15 @@ impl Config {
          .join("config.toml"))
    }
 
-   /// Checks if the given address is a known device and returns its name.
-   pub fn is_known_device(&self, address: &str) -> Option<&str> {
-      self
-         .known_devices
-         .iter()
-         .find(|d| d.address == address)
-         .map(|d| d.name.as_str())
+   /// Checks if the given address is listed in `known_devices`.
+   ///
+   /// Addresses are compared as addresses, so the case of the hex digits does not matter.
+   pub fn is_known_device(&self, address: Address) -> bool {
+      self.known_devices.iter().any(|d| {
+         d.address
+            .parse::<Address>()
+            .is_ok_and(|known| known == address)
+      })
    }
 }
 
@@ -112,5 +115,14 @@ mod tests {
       .unwrap();
       assert!(!config.export_bluez_battery);
       assert!(config.known_devices.is_empty());
+   }
+
+   #[test]
+   fn known_device_address_ignores_case() {
+      let config: Config =
+         toml::from_str("[[known_devices]]\naddress = \"aa:bb:cc:dd:ee:0f\"\nname = \"Pods\"\n")
+            .unwrap();
+      assert!(config.is_known_device(Address([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x0F])));
+      assert!(!config.is_known_device(Address([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x00])));
    }
 }

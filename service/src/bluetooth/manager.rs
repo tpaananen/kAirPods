@@ -606,7 +606,7 @@ impl ManagerActor {
    async fn is_airpods_device(&self, device: &bluer::Device) -> bool {
       // Check known addresses
       let addr = device.address();
-      if self.config.is_known_device(&addr.to_string()).is_some() {
+      if self.config.is_known_device(addr) {
          return true;
       }
       airpods::recognition::is_device_airpods(device).await
