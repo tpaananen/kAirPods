@@ -460,7 +460,8 @@ impl BatteryStudy {
 pub struct BatteryTracker {
    left_history: BatteryHistory,
    right_history: BatteryHistory,
-   last_ttl_estimate: Option<u32>,
+   /// Smoothed drain rate in percent per hour, from which the time left is calculated
+   last_drain_rate: Option<f64>,
    /// When drain data was last written to the study database
    last_save: Option<Instant>,
    study: Option<BatteryStudy>,
@@ -530,23 +531,23 @@ impl BatteryTracker {
       noise_mode: Option<NoiseControlMode>,
       address: Address,
    ) -> Option<u32> {
-      let prev_estimate = self.last_ttl_estimate;
+      let prev_rate = self.last_drain_rate;
 
       // Don't estimate if either bud is charging
       let (left, right) = battery_info.split_ref();
       if left.is_charging() || right.is_charging() {
-         if prev_estimate.is_some() {
+         if prev_rate.is_some() {
             debug!("Battery TTL estimation unavailable: AirPods are charging");
-            self.last_ttl_estimate = None;
+            self.last_drain_rate = None;
          }
          return None;
       }
 
       // Don't estimate if either bud is disconnected
       if !left.is_available() || !right.is_available() {
-         if prev_estimate.is_some() {
+         if prev_rate.is_some() {
             debug!("Battery TTL estimation unavailable: One or both buds disconnected");
-            self.last_ttl_estimate = None;
+            self.last_drain_rate = None;
          }
          return None;
       }
@@ -585,51 +586,44 @@ impl BatteryTracker {
       {
          (rate, alpha)
       } else {
-         if prev_estimate.is_some() {
+         if prev_rate.is_some() {
             debug!("Battery TTL estimation unavailable: No drain rate available");
-            self.last_ttl_estimate = None;
+            self.last_drain_rate = None;
          }
          return None;
       };
 
       // Guard against zero or near-zero drain rate
       if drain_rate <= f64::EPSILON {
-         if prev_estimate.is_some() {
+         if prev_rate.is_some() {
             debug!("Battery TTL estimation unavailable: Drain rate is effectively zero");
-            self.last_ttl_estimate = None;
+            self.last_drain_rate = None;
          }
          return None;
       }
 
+      // Smooth the rate, not the time left: the level keeps falling, so smoothed minutes
+      // would trail behind it and overstate the time left
+      let smoothed_rate = prev_rate.map_or(drain_rate, |prev| {
+         drain_rate.mul_add(alpha, prev * (1.0 - alpha))
+      });
+
       // Use the minimum battery level for conservative estimate
       let min_level = f64::from(left.level.min(right.level));
-
-      // Calculate hours remaining
-      let hours_remaining = min_level / drain_rate;
-
-      // Convert to minutes
-      let new_minutes = (hours_remaining * 60.0) as u32;
+      let new_minutes = (min_level / smoothed_rate * 60.0).round() as u32;
 
       if new_minutes > 0 && new_minutes < 24 * 60 {
-         // Apply hysteresis to avoid jumpy estimates
-         let smoothed_minutes = if let Some(last_estimate) = prev_estimate {
-            let smoothed =
-               f64::from(new_minutes).mul_add(alpha, f64::from(last_estimate) * (1.0 - alpha));
-            smoothed.round() as u32
-         } else {
+         if prev_rate.is_none() {
             info!("Battery TTL estimation now available: {new_minutes} minutes remaining");
-            new_minutes
-         };
-
-         // Cache the smoothed estimate
-         self.last_ttl_estimate = Some(smoothed_minutes);
-         Some(smoothed_minutes)
+         }
+         self.last_drain_rate = Some(smoothed_rate);
+         Some(new_minutes)
       } else {
-         if prev_estimate.is_some() {
+         if prev_rate.is_some() {
             debug!(
                "Battery TTL estimation unavailable: Unreasonable estimate ({new_minutes} minutes)"
             );
-            self.last_ttl_estimate = None;
+            self.last_drain_rate = None;
          }
          None
       }
@@ -873,7 +867,7 @@ impl BatteryTracker {
       self.save_to_study(address, noise_mode);
       self.left_history.clear();
       self.right_history.clear();
-      self.last_ttl_estimate = None;
+      self.last_drain_rate = None;
       self.last_save = None;
    }
 }
@@ -1295,6 +1289,62 @@ mod tests {
       Ok(())
    }
 
+   fn discharging_battery(level: u8) -> BatteryInfo {
+      BatteryInfo {
+         left: mock_state(level, false),
+         right: mock_state(level, false),
+         case: BatteryState::new(),
+         headphone: BatteryState::new(),
+      }
+   }
+
+   /// Drain rate of [`record_drops`]: 1% per 210 s.
+   const RECORDED_RATE: f64 = 3600.0 / 210.0;
+
+   #[test]
+   fn test_time_left_follows_the_level_without_lag() {
+      let mut tracker = BatteryTracker::new(None);
+      record_drops(&mut tracker, Instant::now(), 0..12);
+
+      let first = tracker
+         .estimate_ttl(&discharging_battery(80), None, TEST_ADDRESS)
+         .unwrap();
+      let expected = (80.0 / RECORDED_RATE * 60.0).round() as u32; // 280 minutes
+      assert!(first.abs_diff(expected) <= 1, "{first} vs {expected}");
+
+      // Same drain rate at half the level: exactly half the time left, with no lag
+      let second = tracker
+         .estimate_ttl(&discharging_battery(40), None, TEST_ADDRESS)
+         .unwrap();
+      assert!(second.abs_diff(first / 2) <= 1, "{second} vs {}", first / 2);
+   }
+
+   #[test]
+   fn test_a_new_drain_rate_moves_the_estimate_gradually() {
+      let mut tracker = BatteryTracker::new(None);
+      record_drops(&mut tracker, Instant::now(), 0..12);
+      tracker.estimate_ttl(&discharging_battery(80), None, TEST_ADDRESS);
+
+      // The drain doubles: 1% per 105 s
+      tracker.left_history.clear();
+      tracker.right_history.clear();
+      let base_time = Instant::now();
+      for i in 0..12 {
+         let timestamp = base_time + Duration::from_secs(i * 105);
+         tracker.left_history.push(timestamp, 100 - i as u8);
+         tracker.right_history.push(timestamp, 100 - i as u8);
+      }
+
+      // The rate moves by alpha (0.3 with 10 or more samples) toward the new one, and the
+      // time left follows from that rate
+      let smoothed_rate = (2.0 * RECORDED_RATE).mul_add(0.3, RECORDED_RATE * 0.7);
+      let expected = (80.0 / smoothed_rate * 60.0).round() as u32; // 215 minutes
+      let estimate = tracker
+         .estimate_ttl(&discharging_battery(80), None, TEST_ADDRESS)
+         .unwrap();
+      assert!(estimate.abs_diff(expected) <= 1, "{estimate} vs {expected}");
+   }
+
    #[test]
    fn test_history_without_saves_is_bounded_by_the_ring() {
       let mut tracker = BatteryTracker::new(None);
@@ -1347,7 +1397,7 @@ mod tests {
          tracker.left_history.push(timestamp, 80 - i as u8);
          tracker.right_history.push(timestamp, 80 - i as u8);
       }
-      tracker.last_ttl_estimate = Some(200);
+      tracker.last_drain_rate = Some(20.0);
 
       tracker.end_session(TEST_ADDRESS, NoiseControlMode::Off);
 
@@ -1357,7 +1407,7 @@ mod tests {
             .is_some()
       );
       assert!(tracker.left_history.is_empty() && tracker.right_history.is_empty());
-      assert!(tracker.last_ttl_estimate.is_none() && tracker.last_save.is_none());
+      assert!(tracker.last_drain_rate.is_none() && tracker.last_save.is_none());
 
       // After a suspend the next connection reports a much lower level: it starts a new
       // history instead of extending the old one into a sudden drop
