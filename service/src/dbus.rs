@@ -170,13 +170,6 @@ impl AirPodsService {
    ) -> zbus::Result<()>;
 
    #[zbus(signal)]
-   pub async fn device_name_changed(
-      emitter: &SignalEmitter<'_>,
-      address: &str,
-      name: &str,
-   ) -> zbus::Result<()>;
-
-   #[zbus(signal)]
    pub async fn device_error(emitter: &SignalEmitter<'_>, address: &str) -> zbus::Result<()>;
 
    // Properties for polling-free updates
@@ -187,6 +180,6 @@ impl AirPodsService {
 
    #[zbus(property)]
    async fn connected_count(&self) -> u32 {
-      self.bluetooth_manager.count_devices().await
+      self.bluetooth_manager.count_connected_devices().await
    }
 }

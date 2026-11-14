@@ -139,7 +139,7 @@ enum ManagerCommand {
    DisconnectAAP(Address, Option<oneshot::Sender<Result<()>>>),
    GetDeviceState(Address, oneshot::Sender<Option<AirPods>>),
    GetAllDeviceStates(oneshot::Sender<Vec<AirPods>>),
-   CountDevices(oneshot::Sender<u32>),
+   CountConnectedDevices(oneshot::Sender<u32>),
    Shutdown(oneshot::Sender<()>),
 }
 
@@ -223,11 +223,12 @@ impl BluetoothManager {
       rx.await.unwrap_or_default()
    }
 
-   pub async fn count_devices(&self) -> u32 {
+   /// Number of devices with an established AAP connection.
+   pub async fn count_connected_devices(&self) -> u32 {
       let (tx, rx) = oneshot::channel();
       if self
          .inbox
-         .send(ManagerCommand::CountDevices(tx))
+         .send(ManagerCommand::CountConnectedDevices(tx))
          .await
          .is_err()
       {
@@ -576,8 +577,13 @@ impl ManagerActor {
             let states = self.devices.values().map(|d| d.device.clone()).collect();
             let _ = reply.send(states);
          },
-         ManagerCommand::CountDevices(reply) => {
-            let count = self.devices.len() as u32;
+         ManagerCommand::CountConnectedDevices(reply) => {
+            // Same notion of "connected" as the device JSON
+            let count = self
+               .devices
+               .values()
+               .filter(|d| d.device.is_connected())
+               .count() as u32;
             let _ = reply.send(count);
          },
          ManagerCommand::Shutdown(reply) => {

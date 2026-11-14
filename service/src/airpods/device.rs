@@ -6,7 +6,6 @@
 use core::fmt;
 use std::{
    collections::HashMap,
-   mem,
    sync::{
       Arc, Weak,
       atomic::{AtomicBool, AtomicU64, Ordering},
@@ -62,7 +61,7 @@ impl Drop for ConnectionState {
 struct AirPodsInner {
    address: Address,
    address_str: SmolStr,
-   name: parking_lot::Mutex<SmolStr>,
+   name: SmolStr,
    battery: AtomicCell<Option<BatteryInfo>>,
    is_connected: AtomicBool,
    connected_since: AtomicCell<Option<u64>>,
@@ -150,7 +149,7 @@ impl AirPods {
          address,
          address_str: address.to_smolstr(),
          product_id,
-         name: parking_lot::Mutex::new(name.into()),
+         name: name.into(),
          battery_tracker: parking_lot::Mutex::new(BatteryTracker::new(battery_study)),
          ..Default::default()
       }))
@@ -167,17 +166,8 @@ impl AirPods {
    }
 
    /// Gets the name of the Airpod.
-   pub fn name(&self) -> SmolStr {
-      self.0.name.lock().clone()
-   }
-
-   /// Updates the name of the Airpod.
-   pub fn update_name(&self, name: SmolStr) -> UpdateOp<SmolStr> {
-      let mut lock = self.0.name.lock();
-      if lock.as_str() == name.as_str() {
-         return UpdateOp::Noop;
-      }
-      UpdateOp::Updated(mem::replace(&mut *lock, name))
+   pub fn name(&self) -> &SmolStr {
+      &self.0.name
    }
 
    /// Gets the battery information of the Airpod.
@@ -323,7 +313,7 @@ impl AirPods {
          .0
          .battery_tracker
          .lock()
-         .init_session(self.address(), &self.name());
+         .init_session(self.address(), self.name());
 
       info!("Successfully connected to {}", self.address());
       Ok(jhandle)
@@ -584,17 +574,9 @@ impl AirPods {
             Err(e) => warn!("Failed to parse ear detection: {e}"),
          }
       }
-      // Metadata packets
+      // Metadata packets (device details, not used)
       else if packet.starts_with(HDR_METADATA) {
-         if let Ok(metadata) = parser::parse_metadata(&packet) {
-            debug!("Device metadata for {address}: {metadata:?}");
-
-            if let Some(new_name) = metadata.name_candidate
-               && self.update_name(new_name.clone()).is_updated()
-            {
-               event_tx.emit(self, AirPodsEvent::DeviceNameChanged(new_name));
-            }
-         }
+         debug!("Received metadata from {address} ({} bytes)", packet.len());
       }
       // Other packets
       else if packet.starts_with(HDR_ACK_HANDSHAKE) {

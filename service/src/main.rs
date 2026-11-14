@@ -286,15 +286,6 @@ impl EventProcessor {
                media.pause();
             }
          },
-         AirPodsEvent::DeviceNameChanged(name) => {
-            iface.device_name_changed(addr_str, &name).await?;
-            // Emit property change for devices (name changed)
-            iface
-               .get()
-               .await
-               .devices_changed(iface.signal_emitter())
-               .await?;
-         },
          AirPodsEvent::DeviceError => {
             iface.device_error(addr_str).await?;
             // Emit property change for devices (error state might affect device info)

@@ -3,15 +3,12 @@
 //! This module contains functions to parse various AAP packet types received
 //! from `AirPods` devices over the L2CAP connection.
 
-use std::str;
-
 use log::{debug, warn};
-use smol_str::SmolStr;
 
 use crate::{
    airpods::protocol::{
       BatteryInfo, BatteryState, BatteryStatus, Component, EarDetectionStatus, HDR_BATTERY_STATE,
-      HDR_EAR_DETECTION, HDR_METADATA, NoiseControlMode,
+      HDR_EAR_DETECTION, NoiseControlMode,
    },
    error::Result,
 };
@@ -164,26 +161,6 @@ pub fn parse_battery_status(data: &[u8]) -> Result<BatteryInfo> {
    Ok(battery_info)
 }
 
-#[cfg(test)]
-mod tests {
-   use super::*;
-
-   #[test]
-   fn parses_case_battery_from_three_component_packet() {
-      let packet = [
-         0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03, 0x04, 0x00, 85, 0x01, 0x00, 0x02, 0x00, 78,
-         0x02, 0x00, 0x08, 0x00, 62, 0x01, 0x00,
-      ];
-      let battery = parse_battery_status(&packet).unwrap();
-      assert_eq!(battery.left.level, 85);
-      assert_eq!(battery.right.level, 78);
-      assert_eq!(
-         battery.to_json()["case"],
-         serde_json::json!({"level": 62, "charging": true})
-      );
-   }
-}
-
 pub fn parse_noise_mode(data: &[u8]) -> Result<NoiseControlMode> {
    if data.len() < 8 {
       return Err(
@@ -225,45 +202,22 @@ pub fn parse_ear_detection(data: &[u8]) -> Result<EarDetectionStatus> {
    Ok(EarDetectionStatus::new(!left_out, !right_out))
 }
 
-#[derive(Debug, Default)]
-pub struct Metadata {
-   pub name_candidate: Option<SmolStr>,
-}
+#[cfg(test)]
+mod tests {
+   use super::*;
 
-pub fn parse_metadata(data: &[u8]) -> Result<Metadata> {
-   if !data.starts_with(HDR_METADATA) {
-      return Err(
-         ProtoError::WrongPacketType {
-            expected: "metadata",
-         }
-         .into(),
+   #[test]
+   fn parses_case_battery_from_three_component_packet() {
+      let packet = [
+         0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03, 0x04, 0x00, 85, 0x01, 0x00, 0x02, 0x00, 78,
+         0x02, 0x00, 0x08, 0x00, 62, 0x01, 0x00,
+      ];
+      let battery = parse_battery_status(&packet).unwrap();
+      assert_eq!(battery.left.level, 85);
+      assert_eq!(battery.right.level, 78);
+      assert_eq!(
+         battery.to_json()["case"],
+         serde_json::json!({"level": 62, "charging": true})
       );
    }
-   if data.len() < 20 {
-      return Err(
-         ProtoError::PacketTooShort {
-            expected: 20,
-            actual: data.len(),
-         }
-         .into(),
-      );
-   }
-
-   // Try to extract device name if present
-   let mut name_candidate = None;
-   if data.len() > 15 {
-      let payload = &data[6..];
-      for i in 0..payload.len().saturating_sub(5) {
-         let chunk = &payload[i..i.min(payload.len()).min(i + 10)];
-         if let Ok(text) = str::from_utf8(chunk)
-            && text.chars().any(|c| c.is_alphabetic())
-            && text.trim().len() > 2
-         {
-            name_candidate = Some(text.trim().into());
-            break;
-         }
-      }
-   }
-
-   Ok(Metadata { name_candidate })
 }

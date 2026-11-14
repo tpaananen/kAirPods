@@ -16,18 +16,6 @@ pub struct Config {
    #[serde(default)]
    pub known_devices: Vec<KnownDevice>,
 
-   #[serde(default = "default_poll_interval")]
-   pub poll_interval: u64,
-
-   #[serde(default = "default_retry_count")]
-   pub connection_retry_count: u32,
-
-   #[serde(default = "default_reconnect_delay")]
-   pub reconnect_delay_sec: u64,
-
-   #[serde(default = "default_notification_retries")]
-   pub notification_retries: u32,
-
    #[serde(default = "default_export_bluez_battery")]
    pub export_bluez_battery: bool,
 
@@ -42,22 +30,6 @@ pub struct KnownDevice {
    pub name: String,
 }
 
-const fn default_poll_interval() -> u64 {
-   30
-}
-
-const fn default_retry_count() -> u32 {
-   10
-}
-
-const fn default_notification_retries() -> u32 {
-   3
-}
-
-const fn default_reconnect_delay() -> u64 {
-   10
-}
-
 const fn default_export_bluez_battery() -> bool {
    true
 }
@@ -66,10 +38,6 @@ impl Default for Config {
    fn default() -> Self {
       Self {
          known_devices: vec![],
-         poll_interval: default_poll_interval(),
-         connection_retry_count: default_retry_count(),
-         reconnect_delay_sec: default_reconnect_delay(),
-         notification_retries: default_notification_retries(),
          export_bluez_battery: default_export_bluez_battery(),
          log_filter: None,
       }
@@ -127,5 +95,22 @@ impl Config {
          .iter()
          .find(|d| d.address == address)
          .map(|d| d.name.as_str())
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn keys_removed_from_the_config_are_ignored_in_existing_files() {
+      // Written by earlier versions into every generated config.toml
+      let config: Config = toml::from_str(
+         "known_devices = []\npoll_interval = 30\nconnection_retry_count = 10\n\
+          reconnect_delay_sec = 10\nnotification_retries = 3\nexport_bluez_battery = false\n",
+      )
+      .unwrap();
+      assert!(!config.export_bluez_battery);
+      assert!(config.known_devices.is_empty());
    }
 }
