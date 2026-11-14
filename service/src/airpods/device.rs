@@ -15,7 +15,7 @@ use std::{
 
 use bluer::Address;
 use crossbeam::atomic::AtomicCell;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use serde_json::json;
 use smol_str::{SmolStr, ToSmolStr};
 use tokio::{
@@ -358,7 +358,8 @@ impl AirPods {
       // Save battery study data collected over the connection (reads the noise mode)
       self.end_battery_session();
 
-      self.0.is_connected.store(false, Ordering::Relaxed);
+      // Several paths close a connection; only the first one logs it
+      let was_connected = self.0.is_connected.swap(false, Ordering::Relaxed);
       self.0.connected_since.store(None);
 
       // What the device reported is only valid for the connection that delivered it. The
@@ -368,7 +369,9 @@ impl AirPods {
       self.0.ear_detection.store(None);
       self.0.ear_detection_pods.store(None);
       self.0.battery_ttl.store(None);
-      info!("Disconnected from {}", self.address());
+      if was_connected {
+         info!("Disconnected from {}", self.address());
+      }
    }
 
    async fn start_connection(
@@ -398,7 +401,7 @@ impl AirPods {
 
       // Send handshake
       if let Err(e) = sender.send(PKT_HANDSHAKE).await {
-         error!("Failed to send handshake: {e:?}");
+         warn!("Failed to send handshake: {e:?}");
          return Err(e);
       } else if let Err(e) = wait_for_ack(&mut hs_ack_rx).await {
          warn!("No handshake acknowledgment received ({e:?}), continuing anyway...");
@@ -408,7 +411,7 @@ impl AirPods {
 
       // Send features
       if let Err(e) = sender.send(PKT_SET_FEATURES).await {
-         error!("Failed to send features: {e:?}");
+         warn!("Failed to send features: {e:?}");
          return Err(e);
       } else if let Err(e) = wait_for_ack(&mut feat_ack_rx).await {
          warn!("No features acknowledgment received ({e:?}), continuing anyway...");
@@ -418,7 +421,7 @@ impl AirPods {
 
       // Request notifications
       if let Err(e) = sender.send(PKT_REQUEST_NOTIFY).await {
-         error!("Failed to send notification request: {e:?}");
+         warn!("Failed to send notification request: {e:?}");
          return Err(e);
       }
 

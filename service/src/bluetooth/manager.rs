@@ -706,7 +706,7 @@ impl ManagerActor {
             self.handle_aap_connected(addr, attempt);
          },
          ManagerCommand::AAPDisconnected(addr, attempt, is_error) => {
-            self.handle_aap_disconnected(addr, attempt, is_error);
+            self.handle_aap_disconnected(addr, attempt, is_error).await;
          },
          ManagerCommand::RetryAAP(addr, attempt) => {
             self.handle_aap_retry(addr, attempt).await;
@@ -995,7 +995,7 @@ impl ManagerActor {
          .emit(&device.device, AirPodsEvent::DeviceConnected);
    }
 
-   fn handle_aap_disconnected(&mut self, addr: Address, attempt: u64, is_error: bool) {
+   async fn handle_aap_disconnected(&mut self, addr: Address, attempt: u64, is_error: bool) {
       let Some(device) = self.devices.get_mut(&addr) else {
          return;
       };
@@ -1006,14 +1006,36 @@ impl ManagerActor {
       device.aap_handle = None;
 
       if is_error && device.bluetooth_state == BluetoothState::Connected {
+         // The socket usually notices a lost link before BlueZ reports it. Ask BlueZ, so an
+         // ordinary disconnect is not logged and retried as a failure. A failed read is
+         // treated as a link that is up: the retry checks again.
+         let link_up = match self
+            .adapters
+            .get(&device.adapter_name)
+            .and_then(|info| info.adapter.device(addr).ok())
+         {
+            Some(bluer_device) => bluer_device.is_connected().await.unwrap_or(true),
+            None => true,
+         };
+         if !link_up {
+            debug!("AAP connection to {addr} ended with the Bluetooth link");
+            device.mark_bluetooth_disconnected(&self.event_tx).await;
+            return;
+         }
+
          // Only retry AAP if Bluetooth is still connected
+         let was_open = device.aap_state == AAPState::Connected;
          device.aap_state = AAPState::WaitingToReconnect;
          device.aap_retry_count = device.aap_retry_count.saturating_add(1);
 
          // Schedule AAP reconnection with backoff
          let loopback = self.loopback_tx.clone();
          let delay = calc_retry_delay(device.aap_retry_count);
-         info!("AAP connection to {addr} failed, retrying in {delay:?}");
+         if was_open {
+            warn!("AAP connection to {addr} was lost, retrying in {delay:?}");
+         } else {
+            info!("AAP connection to {addr} failed, retrying in {delay:?}");
+         }
 
          device.retry_handle = Some(tokio::spawn(async move {
             time::sleep(delay).await;
@@ -1147,8 +1169,9 @@ impl ManagerActor {
                   Err(x) => Some(AirPodsError::ActorPanicked(x)),
                };
 
+               // The manager logs what it does about it
                if let Some(err) = &err {
-                  warn!("AAP connection to {addr} terminated: {err:?}");
+                  debug!("AAP connection to {addr} terminated: {err:?}");
                } else {
                   info!("AAP connection to {addr} closed cleanly");
                }
