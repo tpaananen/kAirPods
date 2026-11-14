@@ -3,11 +3,22 @@
 //! This module provides functionality to control media playback using the
 //! MPRIS (Media Player Remote Interfacing Specification) D-Bus interface.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+   sync::atomic::{AtomicBool, Ordering},
+   time::Duration,
+};
 
 use log::{debug, warn};
 use parking_lot::Mutex;
+use tokio::{sync::mpsc, time};
 use zbus::Connection;
+
+/// Maximum time to wait for a reply from the bus or a media player.
+///
+/// zbus has no timeout of its own, so a frozen player would otherwise never answer.
+const CALL_TIMEOUT: Duration = Duration::from_secs(2);
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -23,9 +34,48 @@ pub fn is_enabled() -> bool {
    ENABLED.load(Ordering::Relaxed)
 }
 
+enum Command {
+   Play,
+   Pause,
+}
+
+/// Pauses and resumes media players on a task of its own.
+///
+/// Requests return immediately and run in the order they were made, so a slow or frozen
+/// player cannot hold up the caller.
+pub struct MediaControl {
+   tx: mpsc::UnboundedSender<Command>,
+}
+
+impl MediaControl {
+   /// Starts the media control task, which talks to the players over `connection`.
+   pub fn spawn(connection: Connection) -> Self {
+      let (tx, mut rx) = mpsc::unbounded_channel();
+      tokio::spawn(async move {
+         while let Some(command) = rx.recv().await {
+            match command {
+               Command::Play => send_play(&connection).await,
+               Command::Pause => send_pause(&connection).await,
+            }
+         }
+      });
+      Self { tx }
+   }
+
+   /// Resumes the players paused by the last [`Self::pause`].
+   pub fn play(&self) {
+      let _ = self.tx.send(Command::Play);
+   }
+
+   /// Pauses all playing media players.
+   pub fn pause(&self) {
+      let _ = self.tx.send(Command::Pause);
+   }
+}
+
 /// Sends a play command to all players we previously paused.
 /// Only plays if we previously paused the media.
-pub async fn send_play() {
+async fn send_play(connection: &Connection) {
    if !is_enabled() {
       return;
    }
@@ -48,7 +98,7 @@ pub async fn send_play() {
    let mut successful = 0;
 
    for player_name in &paused_players {
-      match send_mpris_command_to_player("Play", player_name).await {
+      match send_mpris_command_to_player(connection, "Play", player_name).await {
          Ok(()) => {
             debug!("Successfully resumed player: {player_name}");
             successful += 1;
@@ -71,18 +121,13 @@ pub async fn send_play() {
 
 /// Sends a pause command to all playing media players via MPRIS.
 /// Stores all players that were paused (only if they were playing).
-pub async fn send_pause() {
+async fn send_pause(connection: &Connection) {
    if !is_enabled() {
       return;
    }
 
    // Find all playing players and pause them all
-   let Ok(connection) = Connection::session().await else {
-      warn!("Failed to connect to D-Bus session");
-      return;
-   };
-
-   let dbus_proxy = match zbus::fdo::DBusProxy::new(&connection).await {
+   let dbus_proxy = match zbus::fdo::DBusProxy::new(connection).await {
       Ok(proxy) => proxy,
       Err(e) => {
          warn!("Failed to create D-Bus proxy: {e}");
@@ -90,10 +135,14 @@ pub async fn send_pause() {
       },
    };
 
-   let names = match dbus_proxy.list_names().await {
-      Ok(names) => names,
-      Err(e) => {
+   let names = match time::timeout(CALL_TIMEOUT, dbus_proxy.list_names()).await {
+      Ok(Ok(names)) => names,
+      Ok(Err(e)) => {
          warn!("Failed to list D-Bus names: {e}");
+         return;
+      },
+      Err(_) => {
+         warn!("Timed out listing D-Bus names");
          return;
       },
    };
@@ -124,11 +173,11 @@ pub async fn send_pause() {
    // Check each player and pause all that are playing
    for service_name in &mpris_services {
       // Check if this player is playing
-      if let Ok(was_playing) = is_player_playing(service_name.as_str()).await {
+      if let Ok(was_playing) = is_player_playing(connection, service_name.as_str()).await {
          if was_playing {
             debug!("Player {service_name} is playing, pausing it");
             // Pause this player
-            match send_mpris_command_to_player("Pause", service_name.as_str()).await {
+            match send_mpris_command_to_player(connection, "Pause", service_name.as_str()).await {
                Ok(()) => {
                   debug!("Successfully paused player: {service_name}");
                   paused_players.push(service_name.as_str().to_string());
@@ -159,23 +208,22 @@ pub async fn send_pause() {
 }
 
 /// Checks if a specific player is currently playing.
-async fn is_player_playing(
-   service_name: &str,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-   let connection = Connection::session().await?;
+async fn is_player_playing(connection: &Connection, service_name: &str) -> Result<bool, BoxError> {
    let path = zbus::zvariant::ObjectPath::from_str_unchecked("/org/mpris/MediaPlayer2");
    let interface = "org.mpris.MediaPlayer2.Player";
    let property = "PlaybackStatus";
 
-   let reply = connection
-      .call_method(
+   let reply = time::timeout(
+      CALL_TIMEOUT,
+      connection.call_method(
          Some(service_name),
          &path,
          Some("org.freedesktop.DBus.Properties"),
          "Get",
          &(interface, property),
-      )
-      .await?;
+      ),
+   )
+   .await??;
 
    let body = reply.body();
    let variant: zbus::zvariant::Value = body.deserialize()?;
@@ -195,18 +243,20 @@ async fn is_player_playing(
 
 /// Sends a command to a specific player by service name.
 async fn send_mpris_command_to_player(
+   connection: &Connection,
    method: &str,
    service_name: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-   let connection = Connection::session().await?;
+) -> Result<(), BoxError> {
    let path = zbus::zvariant::ObjectPath::from_str_unchecked("/org/mpris/MediaPlayer2");
    let interface = "org.mpris.MediaPlayer2.Player";
 
    debug!("Sending {method} command to specific player: {service_name}");
 
-   connection
-      .call_method(Some(service_name), &path, Some(interface), method, &())
-      .await?;
+   time::timeout(
+      CALL_TIMEOUT,
+      connection.call_method(Some(service_name), &path, Some(interface), method, &()),
+   )
+   .await??;
 
    Ok(())
 }

@@ -19,6 +19,7 @@ use zbus::{Connection, connection, object_server::InterfaceRef};
 use bluetooth::manager::BluetoothManager;
 use dbus::AirPodsService;
 use event::{AirPodsEvent, EventBus};
+use media_control::MediaControl;
 
 mod airpods;
 mod battery_provider;
@@ -192,6 +193,7 @@ impl EventProcessor {
       iface: &InterfaceRef<AirPodsService>,
       (device, event): (AirPods, AirPodsEvent),
       bluez_battery: Option<&BluezBatteryManager>,
+      media: &MediaControl,
    ) -> Result<()> {
       let addr_str = device.address_str();
       match event {
@@ -204,12 +206,12 @@ impl EventProcessor {
             }
             // Emit property changes
             iface
-               .get_mut()
+               .get()
                .await
                .devices_changed(iface.signal_emitter())
                .await?;
             iface
-               .get_mut()
+               .get()
                .await
                .connected_count_changed(iface.signal_emitter())
                .await?;
@@ -221,12 +223,12 @@ impl EventProcessor {
             iface.device_disconnected(addr_str).await?;
             // Emit property changes
             iface
-               .get_mut()
+               .get()
                .await
                .devices_changed(iface.signal_emitter())
                .await?;
             iface
-               .get_mut()
+               .get()
                .await
                .connected_count_changed(iface.signal_emitter())
                .await?;
@@ -242,7 +244,7 @@ impl EventProcessor {
                .await?;
             // Emit property change for devices (battery state changed)
             iface
-               .get_mut()
+               .get()
                .await
                .devices_changed(iface.signal_emitter())
                .await?;
@@ -251,7 +253,7 @@ impl EventProcessor {
             iface.noise_control_changed(addr_str, mode.to_str()).await?;
             // Emit property change for devices (noise control state changed)
             iface
-               .get_mut()
+               .get()
                .await
                .devices_changed(iface.signal_emitter())
                .await?;
@@ -265,7 +267,7 @@ impl EventProcessor {
                .await?;
             // Emit property change for devices (ear detection state changed)
             iface
-               .get_mut()
+               .get()
                .await
                .devices_changed(iface.signal_emitter())
                .await?;
@@ -278,17 +280,17 @@ impl EventProcessor {
                debug!("Initial ear detection state for {addr_str}, leaving playback alone");
             } else if both_in_ear {
                // Both AirPods are in ear - send play command
-               media_control::send_play().await;
+               media.play();
             } else {
                // At least one AirPod is out of ear - send pause command
-               media_control::send_pause().await;
+               media.pause();
             }
          },
          AirPodsEvent::DeviceNameChanged(name) => {
             iface.device_name_changed(addr_str, &name).await?;
             // Emit property change for devices (name changed)
             iface
-               .get_mut()
+               .get()
                .await
                .devices_changed(iface.signal_emitter())
                .await?;
@@ -297,7 +299,7 @@ impl EventProcessor {
             iface.device_error(addr_str).await?;
             // Emit property change for devices (error state might affect device info)
             iface
-               .get_mut()
+               .get()
                .await
                .devices_changed(iface.signal_emitter())
                .await?;
@@ -315,9 +317,14 @@ impl EventProcessor {
          .object_server()
          .interface::<_, AirPodsService>("/org/kairpods/manager")
          .await?;
+      // Media players are driven from their own task, so they cannot delay the signals
+      let media = MediaControl::spawn(connection);
       tokio::spawn(async move {
          while let Some(event) = self.recv().await {
-            if let Err(e) = self.dispatch(&iface, event, bluez_battery.as_deref()).await {
+            if let Err(e) = self
+               .dispatch(&iface, event, bluez_battery.as_deref(), &media)
+               .await
+            {
                warn!("Error dispatching event: {e}");
             }
          }
