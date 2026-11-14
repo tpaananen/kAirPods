@@ -9,7 +9,7 @@ use std::{
    mem,
    sync::{
       Arc, Weak,
-      atomic::{AtomicBool, Ordering},
+      atomic::{AtomicBool, AtomicU64, Ordering},
    },
    time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -45,6 +45,8 @@ use crate::{
 /// Internal state for an active L2CAP connection.
 #[derive(Debug)]
 struct ConnectionState {
+   /// Distinguishes this connection from earlier and later ones of the same device
+   id: u64,
    sender: l2cap::L2CapSender,
    jset: JoinSet<()>,
 }
@@ -70,6 +72,7 @@ struct AirPodsInner {
    features: FeatureBitmap,
    features_present: FeatureBitmap,
    conn: RwLock<Option<ConnectionState>>,
+   next_conn_id: AtomicU64,
    battery_tracker: parking_lot::Mutex<BatteryTracker>,
 }
 
@@ -289,7 +292,12 @@ impl AirPods {
    pub async fn connect(&self, event_tx: &EventSender) -> Result<JoinHandle<Option<AirPodsError>>> {
       info!("Connecting to AirPods at {}", self.address());
       let mut conn = self.0.conn.write().await;
-      let _ = conn.take();
+      if conn.take().is_some() {
+         // Replaced a connection that was still open; its packet processor is ignored from
+         // here on, because the connection ids no longer match
+         self.mark_disconnected();
+      }
+      let id = self.0.next_conn_id.fetch_add(1, Ordering::Relaxed);
 
       // Create L2CAP connection
       let mut jset = JoinSet::new();
@@ -298,10 +306,10 @@ impl AirPods {
       let (receiver, sender) = self.start_connection(&mut jset).await?;
 
       // Start packet processor with direct access to fields
-      let jhandle = self.start_packet_processor(receiver, event_tx.clone());
+      let jhandle = self.start_packet_processor(id, receiver, event_tx.clone());
 
       // Store connection state
-      *conn = Some(ConnectionState { sender, jset });
+      *conn = Some(ConnectionState { id, sender, jset });
       self.0.connected_since.store(
          SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -322,24 +330,38 @@ impl AirPods {
    }
 
    pub async fn disconnect(&self) {
-      // Save battery study data before disconnecting
-      self.save_battery_study();
-
-      self.0.is_connected.store(false, Ordering::Relaxed);
-      self.0.connected_since.store(None);
-      let _ = self.0.conn.write().await.take();
-      info!("Disconnected from {}", self.address());
+      let mut conn = self.0.conn.write().await;
+      conn.take();
+      self.mark_disconnected();
    }
 
-   async fn notify_disconnected(&self, event_tx: &EventSender) {
-      // Save battery study data before disconnecting
+   /// Called by the packet processor of connection `conn_id` when that connection ended.
+   ///
+   /// Does nothing if the connection was already closed by [`Self::disconnect`] or replaced
+   /// by a newer one, so a late processor cannot tear down a connection it does not own.
+   async fn notify_disconnected(&self, conn_id: u64, event_tx: &EventSender) {
+      let mut conn = self.0.conn.write().await;
+      if conn.as_ref().is_none_or(|conn| conn.id != conn_id) {
+         debug!(
+            "{}: connection {conn_id} was already closed or replaced",
+            self.address()
+         );
+         return;
+      }
+      conn.take();
+      self.mark_disconnected();
+      drop(conn);
+      event_tx.emit(self, AirPodsEvent::DeviceDisconnected);
+   }
+
+   /// Updates the device state after its connection was dropped. Call with `conn` locked.
+   fn mark_disconnected(&self) {
+      // Save battery study data collected over the connection
       self.save_battery_study();
 
       self.0.is_connected.store(false, Ordering::Relaxed);
       self.0.connected_since.store(None);
-      let _ = self.0.conn.write().await.take();
       info!("Disconnected from {}", self.address());
-      event_tx.emit(self, AirPodsEvent::DeviceDisconnected);
    }
 
    async fn start_connection(
@@ -427,6 +449,7 @@ impl AirPods {
 
    fn start_packet_processor(
       &self,
+      conn_id: u64,
       mut rx: l2cap::L2CapReceiver,
       event_tx: EventSender,
    ) -> JoinHandle<Option<AirPodsError>> {
@@ -446,7 +469,7 @@ impl AirPods {
                },
                Err(e) => {
                   if let Some(this) = weak.upgrade() {
-                     this.notify_disconnected(&event_tx).await;
+                     this.notify_disconnected(conn_id, &event_tx).await;
                   } else {
                      warn!("{addr}: Connection closed: {e:?}");
                   }
@@ -670,6 +693,7 @@ impl AirPods {
 #[cfg(test)]
 mod tests {
    use super::*;
+   use crate::event::EventBus;
 
    #[tokio::test]
    async fn connected_since_is_serialized_and_cleared_on_disconnect() {
@@ -682,5 +706,61 @@ mod tests {
 
       device.disconnect().await;
       assert!(device.to_json().get("connected_since").is_none());
+   }
+
+   #[derive(Default)]
+   struct RecordedEvents(parking_lot::Mutex<Vec<AirPodsEvent>>);
+
+   impl EventBus for RecordedEvents {
+      fn emit(&self, _device: &AirPods, event: AirPodsEvent) {
+         self.0.lock().push(event);
+      }
+   }
+
+   async fn set_connection(device: &AirPods, id: u64) {
+      *device.0.conn.write().await = Some(ConnectionState {
+         id,
+         sender: L2CapSender::disconnected(),
+         jset: JoinSet::new(),
+      });
+      device.0.is_connected.store(true, Ordering::Relaxed);
+   }
+
+   #[tokio::test]
+   async fn late_packet_processor_cannot_close_newer_connection() {
+      let device = AirPods::new(Address::default(), "test".into(), None, None);
+      let events = Arc::new(RecordedEvents::default());
+      let event_tx: EventSender = events.clone();
+
+      // Connection 2 replaced connection 1, whose packet processor ends afterwards
+      set_connection(&device, 2).await;
+      device.notify_disconnected(1, &event_tx).await;
+      assert!(device.is_connected());
+      assert!(device.0.conn.read().await.is_some());
+      assert!(events.0.lock().is_empty());
+
+      // The current connection ends on its own
+      device.notify_disconnected(2, &event_tx).await;
+      assert!(!device.is_connected());
+      assert!(device.0.conn.read().await.is_none());
+      assert!(matches!(
+         events.0.lock().as_slice(),
+         [AirPodsEvent::DeviceDisconnected]
+      ));
+   }
+
+   #[tokio::test]
+   async fn packet_processor_stays_silent_after_disconnect() {
+      let device = AirPods::new(Address::default(), "test".into(), None, None);
+      let events = Arc::new(RecordedEvents::default());
+      let event_tx: EventSender = events.clone();
+
+      set_connection(&device, 1).await;
+      device.disconnect().await;
+      assert!(!device.is_connected());
+
+      // The caller of disconnect() reports it; the processor must not report it again
+      device.notify_disconnected(1, &event_tx).await;
+      assert!(events.0.lock().is_empty());
    }
 }

@@ -87,6 +87,15 @@ impl L2CapSender {
    }
 }
 
+#[cfg(test)]
+impl L2CapSender {
+   /// Sender without a socket behind it; every send fails with `ConnectionClosed`.
+   pub fn disconnected() -> Self {
+      let (tx, _rx) = mpsc::channel(1);
+      Self { tx }
+   }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum HookDisposition {
    Discard,

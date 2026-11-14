@@ -3,10 +3,7 @@
 //! This module handles Bluetooth adapter management, device discovery,
 //! and connection lifecycle for `AirPods` devices.
 
-use std::{
-   collections::{HashMap, HashSet},
-   time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
 use bluer::{Adapter, AdapterEvent, AdapterProperty, Address, Session};
 use futures::stream::StreamExt;
@@ -88,6 +85,35 @@ struct ManagedDevice {
    aap_retry_count: u32,
    last_aap_error: Option<String>,
    aap_handle: Option<JoinHandle<()>>,
+   /// Identifies the connection attempt whose task may report back; 0 when there is none
+   aap_attempt: u64,
+   /// Pending delayed reconnect after a failed connection
+   retry_handle: Option<JoinHandle<()>>,
+   /// The user disconnected AAP: do not reconnect on our own until Bluetooth reconnects
+   user_disconnected: bool,
+}
+
+impl ManagedDevice {
+   /// Stops the connection task and any pending reconnect.
+   ///
+   /// Messages they already queued are ignored from here on, because the attempt they
+   /// carry is no longer current.
+   fn stop_aap(&mut self) {
+      if let Some(handle) = self.aap_handle.take() {
+         handle.abort();
+      }
+      if let Some(handle) = self.retry_handle.take() {
+         handle.abort();
+      }
+      self.aap_attempt = 0;
+   }
+
+   /// Whether the manager should establish the AAP connection on its own.
+   fn wants_aap(&self) -> bool {
+      self.bluetooth_state == BluetoothState::Connected
+         && !self.user_disconnected
+         && matches!(self.aap_state, AAPState::Disconnected | AAPState::Failed(_))
+   }
 }
 
 // === Commands ===
@@ -103,12 +129,13 @@ enum ManagerCommand {
    DeviceDiscovered(Address, SmolStr), // address, adapter_name
    BluetoothConnected(Address),
    BluetoothDisconnected(Address),
-   AAPConnected(Address),
-   AAPDisconnected(Address, bool), // address, is_error
+   AAPConnected(Address, u64),          // address, attempt
+   AAPDisconnected(Address, u64, bool), // address, attempt, is_error
+   RetryAAP(Address, u64),              // address, attempt
    DeviceLost(Address),
 
    // User commands
-   EstablishAAP(Address, Option<oneshot::Sender<Result<()>>>),
+   EstablishAAP(Address, oneshot::Sender<Result<()>>),
    DisconnectAAP(Address, Option<oneshot::Sender<Result<()>>>),
    GetDeviceState(Address, oneshot::Sender<Option<AirPods>>),
    GetAllDeviceStates(oneshot::Sender<Vec<AirPods>>),
@@ -153,7 +180,7 @@ impl BluetoothManager {
       let (tx, rx) = oneshot::channel();
       self
          .inbox
-         .send(ManagerCommand::EstablishAAP(address, Some(tx)))
+         .send(ManagerCommand::EstablishAAP(address, tx))
          .await
          .map_err(|_| AirPodsError::ManagerShutdown)?;
       rx.await.map_err(|_| AirPodsError::ManagerShutdown)?
@@ -226,7 +253,8 @@ struct ManagerActor {
    // State
    adapters: HashMap<SmolStr, AdapterInfo>,
    devices: HashMap<Address, ManagedDevice>,
-   aap_connecting: HashSet<Address>, // Prevent duplicate AAP connections
+   /// Source of unique AAP connection attempt ids
+   next_attempt: u64,
 }
 
 impl ManagerActor {
@@ -250,7 +278,7 @@ impl ManagerActor {
          shutdown_reply: None,
          adapters: HashMap::new(),
          devices: HashMap::new(),
-         aap_connecting: HashSet::new(),
+         next_attempt: 0,
       })
    }
 
@@ -514,20 +542,25 @@ impl ManagerActor {
          ManagerCommand::BluetoothDisconnected(addr) => {
             self.handle_bluetooth_disconnected(addr);
          },
-         ManagerCommand::AAPConnected(addr) => {
-            self.handle_aap_connected(addr);
+         ManagerCommand::AAPConnected(addr, attempt) => {
+            self.handle_aap_connected(addr, attempt);
          },
-         ManagerCommand::AAPDisconnected(addr, is_error) => {
-            self.handle_aap_disconnected(addr, is_error);
+         ManagerCommand::AAPDisconnected(addr, attempt, is_error) => {
+            self.handle_aap_disconnected(addr, attempt, is_error);
+         },
+         ManagerCommand::RetryAAP(addr, attempt) => {
+            self.handle_aap_retry(addr, attempt).await;
          },
          ManagerCommand::DeviceLost(addr) => {
-            self.handle_device_lost(addr);
+            self.handle_device_lost(addr).await;
          },
          ManagerCommand::EstablishAAP(addr, reply) => {
-            let result = self.establish_aap_connection(addr).await;
-            if let Some(reply) = reply {
-               let _ = reply.send(result);
+            // An explicit request lifts an earlier user disconnect
+            if let Some(device) = self.devices.get_mut(&addr) {
+               device.user_disconnected = false;
             }
+            let result = self.establish_aap_connection(addr).await;
+            let _ = reply.send(result);
          },
          ManagerCommand::DisconnectAAP(addr, reply) => {
             let result = self.disconnect_aap(addr).await;
@@ -583,11 +616,7 @@ impl ManagerActor {
          let devices_to_reconnect: Vec<Address> = self
             .devices
             .iter()
-            .filter(|(_, d)| {
-               d.adapter_name == name
-                  && d.bluetooth_state == BluetoothState::Connected
-                  && matches!(d.aap_state, AAPState::Failed(_) | AAPState::Disconnected)
-            })
+            .filter(|(_, d)| d.adapter_name == name && d.wants_aap())
             .map(|(addr, _)| *addr)
             .collect();
 
@@ -611,10 +640,7 @@ impl ManagerActor {
          for device in self.devices.values_mut() {
             if device.adapter_name == name {
                device.aap_state = AAPState::Failed("Adapter lost");
-               // Abort AAP handle if it exists
-               if let Some(handle) = device.aap_handle.take() {
-                  handle.abort();
-               }
+               device.stop_aap();
                self
                   .event_tx
                   .emit(&device.device, AirPodsEvent::DeviceError);
@@ -636,8 +662,14 @@ impl ManagerActor {
    }
 
    async fn handle_device_discovered(&mut self, addr: Address, adapter_name: SmolStr) {
-      // Check if we already know about this device
-      if self.devices.contains_key(&addr) {
+      // A known device is reported again when the periodic scan finds it connected without
+      // AAP. Reconnect it unless a retry is already pending or the user disconnected it.
+      if let Some(device) = self.devices.get(&addr) {
+         if device.wants_aap()
+            && let Err(e) = self.establish_aap_connection(addr).await
+         {
+            debug!("AAP connection to {addr} not started: {e}");
+         }
          return;
       }
 
@@ -679,6 +711,9 @@ impl ManagerActor {
          aap_retry_count: 0,
          last_aap_error: None,
          aap_handle: None,
+         aap_attempt: 0,
+         retry_handle: None,
+         user_disconnected: false,
       };
 
       self.devices.insert(addr, managed);
@@ -691,6 +726,8 @@ impl ManagerActor {
       // Check if this is an AirPods device
       let is_airpods = if let Some(device) = self.devices.get_mut(&addr) {
          device.bluetooth_state = BluetoothState::Connected;
+         // A new Bluetooth session connects automatically again
+         device.user_disconnected = false;
          true
       } else {
          // Check if this is a newly connected AirPods
@@ -720,79 +757,102 @@ impl ManagerActor {
          device.bluetooth_state = BluetoothState::Disconnected;
 
          // Clean up AAP connection
-         if let Some(handle) = device.aap_handle.take() {
-            handle.abort();
-         }
+         device.stop_aap();
          device.aap_state = AAPState::Disconnected;
 
          self
             .event_tx
             .emit(&device.device, AirPodsEvent::DeviceDisconnected);
       }
-
-      self.aap_connecting.remove(&addr);
    }
 
-   fn handle_aap_connected(&mut self, addr: Address) {
-      if let Some(device) = self.devices.get_mut(&addr) {
-         device.aap_state = AAPState::Connected;
+   fn handle_aap_connected(&mut self, addr: Address, attempt: u64) {
+      let Some(device) = self.devices.get_mut(&addr) else {
+         return;
+      };
+      if device.aap_attempt != attempt {
+         debug!("Ignoring AAP connect of a superseded attempt for {addr}");
+         return;
+      }
+
+      device.aap_state = AAPState::Connected;
+      device.aap_retry_count = 0;
+      device.last_aap_error = None;
+
+      self
+         .event_tx
+         .emit(&device.device, AirPodsEvent::DeviceConnected);
+   }
+
+   fn handle_aap_disconnected(&mut self, addr: Address, attempt: u64, is_error: bool) {
+      let Some(device) = self.devices.get_mut(&addr) else {
+         return;
+      };
+      if device.aap_attempt != attempt {
+         debug!("Ignoring AAP disconnect of a superseded attempt for {addr}");
+         return;
+      }
+      device.aap_handle = None;
+
+      if is_error && device.bluetooth_state == BluetoothState::Connected {
+         // Only retry AAP if Bluetooth is still connected
+         device.aap_state = AAPState::WaitingToReconnect;
+         device.aap_retry_count += 1;
+
+         // Schedule AAP reconnection with backoff
+         let loopback = self.loopback_tx.clone();
+         let delay = calc_retry_delay(device.aap_retry_count);
+         info!("AAP connection to {addr} failed, retrying in {delay:?}");
+
+         device.retry_handle = Some(tokio::spawn(async move {
+            time::sleep(delay).await;
+            let _ = loopback.send(ManagerCommand::RetryAAP(addr, attempt)).await;
+         }));
+      } else {
+         device.aap_state = AAPState::Disconnected;
          device.aap_retry_count = 0;
-         device.last_aap_error = None;
-
-         self
-            .event_tx
-            .emit(&device.device, AirPodsEvent::DeviceConnected);
       }
-
-      self.aap_connecting.remove(&addr);
    }
 
-   fn handle_aap_disconnected(&mut self, addr: Address, is_error: bool) {
-      if let Some(device) = self.devices.get_mut(&addr) {
-         if is_error && device.bluetooth_state == BluetoothState::Connected {
-            // Only retry AAP if Bluetooth is still connected
-            device.aap_state = AAPState::WaitingToReconnect;
-            device.aap_retry_count += 1;
-
-            // Schedule AAP reconnection with backoff
-            let loopback = self.loopback_tx.clone();
-            let delay = calc_retry_delay(device.aap_retry_count);
-            info!("AAP connection to {addr} failed, retrying in {delay:?}");
-
-            tokio::spawn(async move {
-               time::sleep(delay).await;
-               let _ = loopback
-                  .send(ManagerCommand::EstablishAAP(addr, None))
-                  .await;
-            });
-         } else {
-            device.aap_state = AAPState::Disconnected;
-            device.aap_retry_count = 0;
-         }
+   /// Runs the delayed reconnect scheduled by [`Self::handle_aap_disconnected`].
+   async fn handle_aap_retry(&mut self, addr: Address, attempt: u64) {
+      let Some(device) = self.devices.get_mut(&addr) else {
+         return;
+      };
+      if device.aap_attempt != attempt || device.aap_state != AAPState::WaitingToReconnect {
+         return;
       }
 
-      self.aap_connecting.remove(&addr);
+      // No longer waiting: if the attempt cannot start now, the periodic scan tries again
+      device.retry_handle = None;
+      device.aap_state = AAPState::Disconnected;
+      if let Err(e) = self.establish_aap_connection(addr).await {
+         debug!("AAP reconnect to {addr} not started: {e}");
+      }
    }
 
-   fn handle_device_lost(&mut self, addr: Address) {
-      if let Some(device) = self.devices.remove(&addr) {
+   async fn handle_device_lost(&mut self, addr: Address) {
+      if let Some(mut device) = self.devices.remove(&addr) {
+         device.stop_aap();
+         device.device.disconnect().await;
          self
             .event_tx
             .emit(&device.device, AirPodsEvent::DeviceDisconnected);
       }
-      self.aap_connecting.remove(&addr);
    }
 
    async fn establish_aap_connection(&mut self, addr: Address) -> Result<()> {
-      // Check if already connecting
-      if self.aap_connecting.contains(&addr) {
-         return Err(AirPodsError::AlreadyConnecting);
-      }
-
       let device = self
          .devices
          .get_mut(&addr)
          .ok_or(AirPodsError::DeviceNotFound(addr))?;
+
+      match device.aap_state {
+         // Nothing to do: a second connection would only tear down the first
+         AAPState::Connected => return Ok(()),
+         AAPState::Connecting => return Err(AirPodsError::AlreadyConnecting),
+         _ => {},
+      }
 
       // Check adapter is available
       let adapter_info = self
@@ -812,10 +872,14 @@ impl ManagerActor {
       // Get BlueZ device to verify it's paired
       let bluer_device = adapter_info.adapter.device(addr)?;
       if !bluer_device.is_paired().await.unwrap_or(false) {
-         // Clean up on early exit
-         self.aap_connecting.remove(&addr);
          return Err(AirPodsError::DeviceNotPaired);
       }
+
+      // This attempt replaces a pending retry and any earlier task
+      device.stop_aap();
+      self.next_attempt += 1;
+      let attempt = self.next_attempt;
+      device.aap_attempt = attempt;
 
       // Spawn AAP connection task
       let airpods = device.device.clone();
@@ -833,7 +897,10 @@ impl ManagerActor {
                Some(AirPodsError::RequestTimeout)
             },
             Ok(Ok(jhandle)) => {
-               if let Err(e) = loopback.send(ManagerCommand::AAPConnected(addr)).await {
+               if let Err(e) = loopback
+                  .send(ManagerCommand::AAPConnected(addr, attempt))
+                  .await
+               {
                   warn!("Channel overflow sending AAP connected: {e}");
                   return;
                }
@@ -852,7 +919,11 @@ impl ManagerActor {
             },
          };
          if let Err(e) = loopback
-            .send(ManagerCommand::AAPDisconnected(addr, err.is_some()))
+            .send(ManagerCommand::AAPDisconnected(
+               addr,
+               attempt,
+               err.is_some(),
+            ))
             .await
          {
             warn!("Channel overflow sending AAP disconnected: {e}");
@@ -861,9 +932,6 @@ impl ManagerActor {
 
       // Track AAP handle
       device.aap_handle = Some(handle);
-
-      // Mark as connecting only after spawn succeeds
-      self.aap_connecting.insert(addr);
       device.aap_state = AAPState::Connecting;
 
       Ok(())
@@ -875,15 +943,12 @@ impl ManagerActor {
          .get_mut(&addr)
          .ok_or(AirPodsError::DeviceNotFound(addr))?;
 
-      // Abort AAP connection if active
-      if let Some(handle) = device.aap_handle.take() {
-         handle.abort();
-      }
-
+      // Stop the connection and keep it down until the user or Bluetooth reconnects
+      device.stop_aap();
       device.aap_state = AAPState::Disconnected;
+      device.user_disconnected = true;
       device.device.disconnect().await;
 
-      self.aap_connecting.remove(&addr);
       self
          .event_tx
          .emit(&device.device, AirPodsEvent::DeviceDisconnected);
@@ -906,6 +971,9 @@ impl ManagerActor {
 
       // Abort AAP handles and disconnect all devices
       for device in self.devices.values_mut() {
+         if let Some(handle) = device.retry_handle.take() {
+            handle.abort();
+         }
          if let Some(handle) = device.aap_handle.take() {
             handle.abort();
             // Give it a moment to finish
@@ -1010,6 +1078,72 @@ fn calc_retry_delay(retry_count: u32) -> Duration {
    let delay = exponential.min(MAX_AAP_RETRY_DELAY);
    let jitter = rand::thread_rng().gen_range(0..1000);
    delay + Duration::from_millis(jitter)
+}
+
+#[cfg(test)]
+mod managed_device_tests {
+   use super::*;
+
+   fn managed_device() -> ManagedDevice {
+      ManagedDevice {
+         device: AirPods::new(Address::default(), "test".into(), None, None),
+         bluetooth_state: BluetoothState::Connected,
+         aap_state: AAPState::Disconnected,
+         adapter_name: SmolStr::new_static("hci0"),
+         aap_retry_count: 0,
+         last_aap_error: None,
+         aap_handle: None,
+         aap_attempt: 0,
+         retry_handle: None,
+         user_disconnected: false,
+      }
+   }
+
+   #[test]
+   fn connects_on_its_own_only_when_idle_and_allowed() {
+      let mut device = managed_device();
+      assert!(device.wants_aap());
+      device.aap_state = AAPState::Failed("Adapter lost");
+      assert!(device.wants_aap());
+
+      // Connected, in progress, or a retry is already scheduled
+      for state in [
+         AAPState::Connected,
+         AAPState::Connecting,
+         AAPState::WaitingToReconnect,
+      ] {
+         device.aap_state = state;
+         assert!(!device.wants_aap());
+      }
+
+      device.aap_state = AAPState::Disconnected;
+      device.user_disconnected = true;
+      assert!(!device.wants_aap());
+
+      device.user_disconnected = false;
+      device.bluetooth_state = BluetoothState::Disconnected;
+      assert!(!device.wants_aap());
+   }
+
+   #[tokio::test]
+   async fn stop_aap_cancels_tasks_and_invalidates_attempt() {
+      let mut device = managed_device();
+      let connection = tokio::spawn(std::future::pending::<()>());
+      let retry = tokio::spawn(std::future::pending::<()>());
+      let tasks = [connection.abort_handle(), retry.abort_handle()];
+      device.aap_handle = Some(connection);
+      device.retry_handle = Some(retry);
+      device.aap_attempt = 7;
+
+      device.stop_aap();
+
+      assert_eq!(device.aap_attempt, 0);
+      assert!(device.aap_handle.is_none() && device.retry_handle.is_none());
+      for _ in 0..10 {
+         tokio::task::yield_now().await;
+      }
+      assert!(tasks.iter().all(|task| task.is_finished()));
+   }
 }
 
 #[cfg(test)]
