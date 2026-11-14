@@ -79,20 +79,13 @@ impl<T: Default + Copy, const N: usize> Ring<T, N> {
    /// The first slice contains the older elements, the second the newer ones.
    /// The slices are in logical order from oldest to newest.
    pub fn as_slices(&self) -> (&[T], &[T]) {
-      let len = self.len();
-      if len == 0 {
-         return (&[], &[]);
-      }
-
-      let head = self.head();
-      let tail_pos = self.tail % N;
-
-      if self.tail <= N || head < tail_pos {
-         // Data is contiguous
-         (&self.data[head..tail_pos], &[])
+      if self.tail <= N {
+         // Not wrapped yet: elements sit at the start in insertion order
+         (&self.data[..self.tail], &[])
       } else {
-         // Data wraps around
-         (&self.data[head..], &self.data[..tail_pos])
+         // Wrapped: the oldest element is at `head`, the newest right before it
+         let head = self.head();
+         (&self.data[head..], &self.data[..head])
       }
    }
 
@@ -263,6 +256,25 @@ mod tests {
       let (left, right) = rb.as_slices();
       assert_eq!(left, &[2, 3, 4]);
       assert_eq!(right, &[5]);
+   }
+
+   #[test]
+   fn as_slices_exactly_full() {
+      let mut rb: Ring<i32, 4> = Ring::new();
+      for i in 1..=4 {
+         rb.push(i);
+      } // tail == N: full, but nothing overwritten yet
+
+      let (left, right) = rb.as_slices();
+      assert_eq!(left, &[1, 2, 3, 4]);
+      assert!(right.is_empty());
+      assert_eq!(rb.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+
+      // Full again after wrapping around completely
+      for i in 5..=8 {
+         rb.push(i);
+      }
+      assert_eq!(rb.iter().copied().collect::<Vec<_>>(), vec![5, 6, 7, 8]);
    }
 
    #[test]

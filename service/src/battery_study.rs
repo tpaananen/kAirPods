@@ -6,14 +6,14 @@
 
 use std::{
    borrow::{Borrow, Cow},
-   path::PathBuf,
+   path::{Path, PathBuf},
    sync::{Arc, LazyLock},
    time::{Duration, Instant, SystemTime},
 };
 
 use bluer::Address;
 use heed::{Database, Env, EnvOpenOptions, types::SerdeBincode};
-use log::{debug, info};
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -50,8 +50,13 @@ pub enum Error {
 
 /// Ring buffer for tracking battery history.
 const BATTERY_HISTORY_SIZE: usize = 32;
-/// Minimum number of samples to save a battery study
+/// Minimum number of not yet saved samples to save a battery study
 const MIN_SAMPLES_TO_SAVE: usize = 3;
+/// Upper bound on the weight of stored drain statistics, in samples (1 sample = 1% drop).
+///
+/// Keeps new sessions relevant as the battery ages, and bounds the sample counts that
+/// earlier versions inflated by saving the same samples on every tick.
+const MAX_STUDY_SAMPLES: u32 = 200;
 
 static BASE_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 
@@ -88,11 +93,14 @@ impl SecondsSinceInit {
 #[derive(Default, Debug, Clone, Copy)]
 struct BatteryHistory {
    samples: Ring<(SecondsSinceInit, u8), BATTERY_HISTORY_SIZE>, // (seconds since init, level)
+   /// Number of newest samples that were not saved to the study database yet
+   unsaved: usize,
 }
 
 impl BatteryHistory {
    fn push(&mut self, timestamp: Instant, level: u8) {
       self.samples.push((timestamp.into(), level));
+      self.unsaved = (self.unsaved + 1).min(BATTERY_HISTORY_SIZE);
    }
 
    fn iter(&self) -> impl ExactSizeIterator<Item = (SecondsSinceInit, u8)> + Clone + '_ {
@@ -109,6 +117,13 @@ impl BatteryHistory {
 
    const fn clear(&mut self) {
       self.samples.clear();
+      self.unsaved = 0;
+   }
+
+   /// Keeps only the most recent `count` samples.
+   fn truncate_front(&mut self, count: usize) {
+      self.samples.truncate_front(count);
+      self.unsaved = self.unsaved.min(self.len());
    }
 
    fn last_level(&self) -> Option<u8> {
@@ -227,14 +242,18 @@ pub struct BatteryStudy {
 impl BatteryStudy {
    /// Open or create the battery study database
    pub fn open() -> Result<Self> {
-      let path = Self::db_path()?;
-      std::fs::create_dir_all(&path)?;
+      Self::open_at(&Self::db_path()?)
+   }
+
+   /// Open or create the battery study database at `path`
+   fn open_at(path: &Path) -> Result<Self> {
+      std::fs::create_dir_all(path)?;
 
       let env = unsafe {
          EnvOpenOptions::new()
             .map_size(10 * 1024 * 1024) // 10MB should be plenty
             .max_dbs(1)
-            .open(&path)
+            .open(path)
             .map_err(Error::OpenEnvironment)?
       };
 
@@ -328,6 +347,9 @@ impl BatteryStudy {
             last_updated: 0,
          });
 
+      // Cap the weight of the stored history, so new data keeps moving the estimate
+      stats.samples = stats.samples.min(MAX_STUDY_SAMPLES);
+
       // Update with Welford's online algorithm for mean and variance
       let k = f64::from(samples);
       let n = f64::from(stats.samples);
@@ -375,8 +397,9 @@ impl BatteryStudy {
 
       if let Some(stats) = study.drain_rates.get(mode) {
          // Calculate 95% confidence interval
-         let confidence = if stats.samples > 1 {
-            1.96 * (stats.variance / f64::from(stats.samples)).sqrt()
+         let samples = stats.samples.min(MAX_STUDY_SAMPLES);
+         let confidence = if samples > 1 {
+            1.96 * (stats.variance / f64::from(samples)).sqrt()
          } else {
             f64::INFINITY
          };
@@ -419,6 +442,8 @@ pub struct BatteryTracker {
    left_history: BatteryHistory,
    right_history: BatteryHistory,
    last_ttl_estimate: Option<u32>,
+   /// When drain data was last written to the study database
+   last_save: Option<Instant>,
    study: Option<BatteryStudy>,
    // Cache for historical drain rates to reduce DB queries
    historical_cache: Mutex<NoiseControlMap<(f64, f64, Instant)>>, // (rate, confidence, last_updated)
@@ -730,15 +755,20 @@ impl BatteryTracker {
       }
    }
 
-   /// Checks if enough time has passed and samples collected to warrant a periodic save.
+   /// Number of samples recorded since the last save, for the bud with the most new data.
+   fn unsaved_samples(&self) -> usize {
+      self.left_history.unsaved.max(self.right_history.unsaved)
+   }
+
+   /// Checks if enough time has passed and new samples collected to warrant a periodic save.
    pub fn should_save(&self, interval_minutes: u32, battery_info: &BatteryInfo) -> bool {
-      // Check if we have enough samples
-      let sample_count = self.left_history.len().max(self.right_history.len());
+      // Check if we have enough samples that were not saved yet
+      let sample_count = self.unsaved_samples();
       if sample_count < MIN_SAMPLES_TO_SAVE {
          debug!(
-            "should_save: Not enough samples yet (have {sample_count}, need {MIN_SAMPLES_TO_SAVE})"
+            "should_save: Not enough new samples yet (have {sample_count}, need {MIN_SAMPLES_TO_SAVE})"
          );
-         return false; // Not enough samples yet
+         return false; // Not enough new samples yet
       }
 
       // Check if neither bud is charging
@@ -752,7 +782,8 @@ impl BatteryTracker {
          return false; // Don't save while charging
       }
 
-      // Check time since oldest sample (using actual sample time, not base_time)
+      // Check time since the last save, or since the oldest sample if that is more recent
+      // (nothing saved yet, or history restarted after charging)
       let oldest_time = match (
          self.left_history.oldest_timestamp(),
          self.right_history.oldest_timestamp(),
@@ -765,7 +796,10 @@ impl BatteryTracker {
          },
       };
 
-      let elapsed = Instant::now().duration_since(oldest_time);
+      let since = self
+         .last_save
+         .map_or(oldest_time, |saved| saved.max(oldest_time));
+      let elapsed = Instant::now().duration_since(since);
       let required_duration = Duration::from_secs(u64::from(interval_minutes * 60));
       let should_save = elapsed >= required_duration;
 
@@ -780,20 +814,33 @@ impl BatteryTracker {
    }
 
    /// Saves aggregated battery drain data to the study database.
+   ///
+   /// Each sample is counted once: the drain rate is weighted by the samples recorded
+   /// since the last save, and nothing is written when there are none.
    pub fn save_to_study(&mut self, address: Address, noise_mode: NoiseControlMode) {
-      if let Some(ref study) = self.study {
+      let new_samples = self.unsaved_samples();
+      if new_samples > 0
+         && let Some(study) = &self.study
          // Calculate drain rate from current session
-         if let Some((drain_rate, _alpha, sample_count)) = self.calculate_local_drain_rate()
-            && sample_count >= 4
-         {
-            // Update drain rate statistics in the database
-            let _ = study.update_drain_rate(address, noise_mode, drain_rate, sample_count as u32);
-            debug!(
-               "Saved battery drain rate of {drain_rate:.1}%/hr for mode {noise_mode} with {sample_count} samples"
-            );
+         && let Some((drain_rate, _alpha, sample_count)) = self.calculate_local_drain_rate()
+         && sample_count >= 4
+      {
+         self.last_save = Some(Instant::now());
 
-            // Clear cache for this mode to force refresh
-            self.historical_cache.lock().remove(noise_mode);
+         // Update drain rate statistics in the database
+         match study.update_drain_rate(address, noise_mode, drain_rate, new_samples as u32) {
+            Ok(()) => {
+               debug!(
+                  "Saved battery drain rate of {drain_rate:.1}%/hr for mode {noise_mode} with {new_samples} new samples"
+               );
+
+               // Clear cache for this mode to force refresh
+               self.historical_cache.lock().remove(noise_mode);
+
+               self.left_history.unsaved = 0;
+               self.right_history.unsaved = 0;
+            },
+            Err(e) => warn!("Failed to save battery drain rate for {address}: {e}"),
          }
       }
 
@@ -807,7 +854,7 @@ impl BatteryTracker {
 
       for history in [&mut self.left_history, &mut self.right_history] {
          if history.len() > KEEP_COUNT {
-            history.samples.truncate_front(KEEP_COUNT);
+            history.truncate_front(KEEP_COUNT);
          }
       }
    }
@@ -879,10 +926,7 @@ mod tests {
 
    fn create_test_db() -> Result<(BatteryStudy, TempDir)> {
       let temp_dir = TempDir::new().unwrap();
-      unsafe {
-         std::env::set_var("HOME", temp_dir.path());
-      }
-      let manager = BatteryStudy::open()?;
+      let manager = BatteryStudy::open_at(temp_dir.path())?;
       Ok((manager, temp_dir))
    }
 
@@ -1114,6 +1158,86 @@ mod tests {
       // Note: In real usage, time would have passed between samples
       // The test will likely still return false because not enough time has elapsed
       // This is expected behavior
+   }
+
+   #[test]
+   fn test_save_counts_each_sample_once() -> Result<()> {
+      let (study, _dir) = create_test_db()?;
+      study.get_or_create_study(TEST_ADDRESS, SmolStr::new_static("Test AirPods"))?;
+      let mut tracker = BatteryTracker::new(Some(study.clone()));
+
+      let saved_samples = || -> Result<Option<u32>> {
+         let device =
+            study.get_or_create_study(TEST_ADDRESS, SmolStr::new_static("Test AirPods"))?;
+         Ok(device
+            .drain_rates
+            .get(NoiseControlMode::Off)
+            .map(|stats| stats.samples))
+      };
+
+      // One 1% drop every 3.5 minutes (~17%/hr); interval 0 stands in for elapsed time
+      let base_time = Instant::now();
+      let record = |tracker: &mut BatteryTracker, i: u64| {
+         let timestamp = base_time + Duration::from_secs(i * 210);
+         tracker.left_history.push(timestamp, 100 - i as u8);
+         tracker.right_history.push(timestamp, 100 - i as u8);
+      };
+      let battery = BatteryInfo {
+         left: mock_state(90, false),
+         right: mock_state(90, false),
+         case: BatteryState::new(),
+         headphone: BatteryState::new(),
+      };
+
+      for i in 0..6 {
+         record(&mut tracker, i);
+      }
+      assert!(tracker.should_save(0, &battery));
+      tracker.save_to_study(TEST_ADDRESS, NoiseControlMode::Off);
+      assert_eq!(saved_samples()?, Some(6));
+
+      // Later ticks without new samples must not save the retained samples again
+      assert!(!tracker.should_save(0, &battery));
+      tracker.save_to_study(TEST_ADDRESS, NoiseControlMode::Off);
+      assert_eq!(saved_samples()?, Some(6));
+
+      // Only the new samples are added
+      for i in 6..9 {
+         record(&mut tracker, i);
+      }
+      assert!(tracker.should_save(0, &battery));
+      tracker.save_to_study(TEST_ADDRESS, NoiseControlMode::Off);
+      assert_eq!(saved_samples()?, Some(9));
+
+      Ok(())
+   }
+
+   #[test]
+   fn test_stored_history_weight_is_capped() -> Result<()> {
+      let (study, _dir) = create_test_db()?;
+      study.get_or_create_study(TEST_ADDRESS, SmolStr::new_static("Test AirPods"))?;
+
+      // Sample count inflated far beyond the cap, as written by earlier versions
+      study.update_drain_rate(TEST_ADDRESS, NoiseControlMode::Active, 10.0, 1_000_000)?;
+      let (_, confidence) = study
+         .get_drain_rate(TEST_ADDRESS, NoiseControlMode::Active)?
+         .unwrap();
+      assert_eq!(confidence, 0.0); // Single update, no variance yet
+
+      // New data with the weight of the cap moves the mean halfway
+      study.update_drain_rate(
+         TEST_ADDRESS,
+         NoiseControlMode::Active,
+         20.0,
+         MAX_STUDY_SAMPLES,
+      )?;
+      let (rate, confidence) = study
+         .get_drain_rate(TEST_ADDRESS, NoiseControlMode::Active)?
+         .unwrap();
+      assert!((rate - 15.0).abs() < 0.001);
+      assert!(confidence > 0.1); // Not collapsed by the inflated count
+
+      Ok(())
    }
 
    #[test]
