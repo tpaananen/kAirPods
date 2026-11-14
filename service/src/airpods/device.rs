@@ -28,9 +28,9 @@ use crate::{
    airpods::{
       parser,
       protocol::{
-         BatteryInfo, EarDetectionStatus, FeatureBitmap, FeatureCmd, FeatureId, HDR_ACK_FEATURES,
-         HDR_ACK_HANDSHAKE, HDR_BATTERY_STATE, HDR_EAR_DETECTION, HDR_METADATA, HDR_NOISE_CTL,
-         NoiseControlMode, PKT_HANDSHAKE, PKT_REQUEST_NOTIFY, PKT_SET_FEATURES,
+         BatteryInfo, Component, EarDetectionStatus, FeatureBitmap, FeatureCmd, FeatureId,
+         HDR_ACK_FEATURES, HDR_ACK_HANDSHAKE, HDR_BATTERY_STATE, HDR_EAR_DETECTION, HDR_METADATA,
+         HDR_NOISE_CTL, NoiseControlMode, PKT_HANDSHAKE, PKT_REQUEST_NOTIFY, PKT_SET_FEATURES,
          build_control_packet,
       },
       recognition::NoiseCapabilities,
@@ -66,6 +66,8 @@ struct AirPodsInner {
    is_connected: AtomicBool,
    connected_since: AtomicCell<Option<u64>>,
    ear_detection: AtomicCell<Option<EarDetectionStatus>>,
+   /// The right earbud is the primary one, as last seen in a battery report
+   right_is_primary: AtomicBool,
    noise_mode: AtomicCell<Option<NoiseControlMode>>,
    product_id: Option<u32>,
    features: FeatureBitmap,
@@ -516,11 +518,26 @@ impl AirPods {
       }
    }
 
+   /// The earbud the device currently uses as primary; left until a battery report says.
+   fn primary_pod(&self) -> Component {
+      if self.0.right_is_primary.load(Ordering::Relaxed) {
+         Component::Right
+      } else {
+         Component::Left
+      }
+   }
+
    fn process_packet(&self, address: Address, packet: Packet, event_tx: &EventSender) {
       // Battery status
       if packet.starts_with(HDR_BATTERY_STATE) {
          match parser::parse_battery_status(&packet) {
             Ok(battery) => {
+               if let Some(primary) = parser::primary_pod(&packet) {
+                  self
+                     .0
+                     .right_is_primary
+                     .store(primary == Component::Right, Ordering::Relaxed);
+               }
                debug!(
                   "Battery updated for {}: L:{}% R:{}% C:{}%",
                   address, battery.left.level, battery.right.level, battery.case.level
@@ -551,13 +568,15 @@ impl AirPods {
       }
       // Ear detection
       else if packet.starts_with(HDR_EAR_DETECTION) {
-         match parser::parse_ear_detection(&packet) {
+         match parser::parse_ear_detection(&packet, self.primary_pod()) {
             Ok(status) => {
                debug!(
-                  "Ear detection updated for {}: L:{} R:{}",
+                  "Ear detection updated for {}: L:{} R:{} (in case L:{} R:{})",
                   address,
                   status.is_left_in_ear(),
-                  status.is_right_in_ear()
+                  status.is_right_in_ear(),
+                  status.is_left_in_case(),
+                  status.is_right_in_case()
                );
 
                let update = self.update_ear_detection(status);
@@ -688,7 +707,10 @@ impl AirPods {
 #[cfg(test)]
 mod tests {
    use super::*;
-   use crate::{airpods::protocol::BatteryStatus, event::EventBus};
+   use crate::{
+      airpods::protocol::{BatteryStatus, PodPlacement},
+      event::EventBus,
+   };
 
    #[tokio::test]
    async fn connected_since_is_serialized_and_cleared_on_disconnect() {
@@ -728,7 +750,10 @@ mod tests {
       battery.left.status = BatteryStatus::Normal;
       device.update_battery_info(battery);
       device.update_noise_mode(NoiseControlMode::Active);
-      device.update_ear_detection(EarDetectionStatus::new(true, true));
+      device.update_ear_detection(EarDetectionStatus::new(
+         PodPlacement::InEar,
+         PodPlacement::InEar,
+      ));
 
       device.disconnect().await;
 

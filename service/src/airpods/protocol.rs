@@ -486,38 +486,72 @@ impl BatteryInfo {
    }
 }
 
+/// Where a single earbud is, as reported by ear detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PodPlacement {
+   InEar,
+   OutOfEar,
+   InCase,
+}
+
+impl PodPlacement {
+   /// Decodes an ear detection byte: 0x00 in ear, 0x01 out of ear, 0x02 in case.
+   ///
+   /// Unknown values count as out of ear, so they never resume playback.
+   pub const fn from_byte(byte: u8) -> Self {
+      match byte {
+         0x00 => Self::InEar,
+         0x02 => Self::InCase,
+         _ => Self::OutOfEar,
+      }
+   }
+}
+
 /// Ear detection status for left and right `AirPods`.
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct EarDetectionStatus(NonZeroU8);
 
 impl EarDetectionStatus {
-   pub const LEFT: u8 = 1 << 0;
-   pub const RIGHT: u8 = 1 << 1;
-   pub const VALID: u8 = 0x80;
+   const LEFT_IN_EAR: u8 = 1 << 0;
+   const RIGHT_IN_EAR: u8 = 1 << 1;
+   const LEFT_IN_CASE: u8 = 1 << 2;
+   const RIGHT_IN_CASE: u8 = 1 << 3;
+   const VALID: u8 = 0x80;
 
-   pub const fn new(left_in_ear: bool, right_in_ear: bool) -> Self {
-      let mut flags = Self::VALID;
-      if left_in_ear {
-         flags |= Self::LEFT;
+   pub const fn new(left: PodPlacement, right: PodPlacement) -> Self {
+      const fn flags(placement: PodPlacement, in_ear: u8, in_case: u8) -> u8 {
+         match placement {
+            PodPlacement::InEar => in_ear,
+            PodPlacement::InCase => in_case,
+            PodPlacement::OutOfEar => 0,
+         }
       }
-      if right_in_ear {
-         flags |= Self::RIGHT;
-      }
+      let flags = Self::VALID
+         | flags(left, Self::LEFT_IN_EAR, Self::LEFT_IN_CASE)
+         | flags(right, Self::RIGHT_IN_EAR, Self::RIGHT_IN_CASE);
       Self(NonZeroU8::new(flags).expect("(x|valid) != 0"))
    }
 
    pub const fn is_left_in_ear(&self) -> bool {
-      self.0.get() & Self::LEFT != 0
+      self.0.get() & Self::LEFT_IN_EAR != 0
    }
    pub const fn is_right_in_ear(&self) -> bool {
-      self.0.get() & Self::RIGHT != 0
+      self.0.get() & Self::RIGHT_IN_EAR != 0
+   }
+   pub const fn is_left_in_case(&self) -> bool {
+      self.0.get() & Self::LEFT_IN_CASE != 0
+   }
+   pub const fn is_right_in_case(&self) -> bool {
+      self.0.get() & Self::RIGHT_IN_CASE != 0
    }
 
    pub fn to_json(self) -> serde_json::Value {
       json!({
           "left_in_ear": self.is_left_in_ear(),
           "right_in_ear": self.is_right_in_ear(),
+          "left_in_case": self.is_left_in_case(),
+          "right_in_case": self.is_right_in_case(),
       })
    }
 }

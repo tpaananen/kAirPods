@@ -8,7 +8,7 @@ use log::{debug, warn};
 use crate::{
    airpods::protocol::{
       BatteryInfo, BatteryState, BatteryStatus, Component, EarDetectionStatus, HDR_BATTERY_STATE,
-      HDR_EAR_DETECTION, NoiseControlMode,
+      HDR_EAR_DETECTION, NoiseControlMode, PodPlacement,
    },
    error::Result,
 };
@@ -179,7 +179,28 @@ pub fn parse_noise_mode(data: &[u8]) -> Result<NoiseControlMode> {
    Ok(mode)
 }
 
-pub fn parse_ear_detection(data: &[u8]) -> Result<EarDetectionStatus> {
+/// Returns the primary earbud of a battery status packet: the first one listed.
+///
+/// The packet must have passed [`parse_battery_status`]. Earbuds reported as
+/// disconnected are skipped; `None` for `AirPods` Max or when no earbud is listed.
+pub fn primary_pod(data: &[u8]) -> Option<Component> {
+   let count = usize::from(*data.get(6)?);
+   data
+      .get(7..)?
+      .as_chunks::<5>()
+      .0
+      .iter()
+      .take(count)
+      .filter(|entry| entry[3] != BatteryStatus::Disconnected as u8)
+      .filter_map(|entry| Component::from_repr(entry[0]))
+      .find(|component| matches!(component, Component::Left | Component::Right))
+}
+
+/// Parses an ear detection packet: `HDR [primary pod] [secondary pod]`.
+///
+/// The bytes refer to the primary and secondary earbud, not to left and right;
+/// `primary` says which side the primary one is.
+pub fn parse_ear_detection(data: &[u8], primary: Component) -> Result<EarDetectionStatus> {
    if !data.starts_with(HDR_EAR_DETECTION) {
       return Err(
          ProtoError::WrongPacketType {
@@ -197,9 +218,13 @@ pub fn parse_ear_detection(data: &[u8]) -> Result<EarDetectionStatus> {
          .into(),
       );
    }
-   let left_out = data[6] == 0x01;
-   let right_out = data[7] == 0x01;
-   Ok(EarDetectionStatus::new(!left_out, !right_out))
+   let primary_pod = PodPlacement::from_byte(data[6]);
+   let secondary_pod = PodPlacement::from_byte(data[7]);
+   Ok(if primary == Component::Right {
+      EarDetectionStatus::new(secondary_pod, primary_pod)
+   } else {
+      EarDetectionStatus::new(primary_pod, secondary_pod)
+   })
 }
 
 #[cfg(test)]
@@ -219,5 +244,60 @@ mod tests {
          battery.to_json()["case"],
          serde_json::json!({"level": 62, "charging": true})
       );
+   }
+
+   fn ear_packet(primary: u8, secondary: u8) -> Vec<u8> {
+      [HDR_EAR_DETECTION, &[primary, secondary]].concat()
+   }
+
+   #[test]
+   fn bud_in_case_is_not_in_ear() {
+      // Primary in ear, secondary in case
+      let status = parse_ear_detection(&ear_packet(0x00, 0x02), Component::Left).unwrap();
+      assert!(status.is_left_in_ear() && !status.is_left_in_case());
+      assert!(!status.is_right_in_ear() && status.is_right_in_case());
+
+      // Out of ear and unknown values are neither in ear nor in case
+      for byte in [0x01, 0x03, 0xff] {
+         let status = parse_ear_detection(&ear_packet(byte, byte), Component::Left).unwrap();
+         assert!(!status.is_left_in_ear() && !status.is_left_in_case());
+         assert!(!status.is_right_in_ear() && !status.is_right_in_case());
+      }
+   }
+
+   #[test]
+   fn ear_detection_follows_primary_pod() {
+      // Primary out of ear, secondary in ear
+      let packet = ear_packet(0x01, 0x00);
+      let status = parse_ear_detection(&packet, Component::Left).unwrap();
+      assert!(!status.is_left_in_ear() && status.is_right_in_ear());
+      let status = parse_ear_detection(&packet, Component::Right).unwrap();
+      assert!(status.is_left_in_ear() && !status.is_right_in_ear());
+   }
+
+   #[test]
+   fn primary_pod_is_first_connected_bud_in_battery_packet() {
+      // Right, left, case
+      let packet = [
+         0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03, 0x02, 0x01, 0x64, 0x02, 0x01, 0x04, 0x01, 0x63,
+         0x01, 0x01, 0x08, 0x01, 0x11, 0x02, 0x01,
+      ];
+      parse_battery_status(&packet).unwrap();
+      assert_eq!(primary_pod(&packet), Some(Component::Right));
+
+      // Case first, then a disconnected right bud: left is primary
+      let packet = [
+         0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03, 0x08, 0x01, 0x50, 0x01, 0x01, 0x02, 0x01, 0x00,
+         0x04, 0x01, 0x04, 0x01, 0x40, 0x02, 0x01,
+      ];
+      parse_battery_status(&packet).unwrap();
+      assert_eq!(primary_pod(&packet), Some(Component::Left));
+
+      // AirPods Max: headphone only
+      let packet = [
+         0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x01, 0x01, 0x01, 0x50, 0x02, 0x01,
+      ];
+      parse_battery_status(&packet).unwrap();
+      assert_eq!(primary_pod(&packet), None);
    }
 }
