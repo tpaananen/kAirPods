@@ -37,6 +37,8 @@ const ADAPTER_RECOVERY_DELAY: Duration = Duration::from_secs(5);
 const MAX_ADAPTER_RECOVERY_DELAY: Duration = Duration::from_secs(120);
 /// Maximum time to wait for AAP connection
 const AAP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Base of the AAP connection retry delay; doubles per failure
+const AAP_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Maximum AAP connection retry delay
 const MAX_AAP_RETRY_DELAY: Duration = Duration::from_secs(120);
 /// Device tick interval
@@ -890,7 +892,7 @@ impl ManagerActor {
       if is_error && device.bluetooth_state == BluetoothState::Connected {
          // Only retry AAP if Bluetooth is still connected
          device.aap_state = AAPState::WaitingToReconnect;
-         device.aap_retry_count += 1;
+         device.aap_retry_count = device.aap_retry_count.saturating_add(1);
 
          // Schedule AAP reconnection with backoff
          let loopback = self.loopback_tx.clone();
@@ -1167,12 +1169,13 @@ fn adapter_retry_delay(retry_count: u32) -> Duration {
       .min(MAX_ADAPTER_RECOVERY_DELAY)
 }
 
+/// Delay before AAP retry number `retry_count` (from 1): 4 s, doubling up to
+/// [`MAX_AAP_RETRY_DELAY`], plus up to a second of jitter.
 fn calc_retry_delay(retry_count: u32) -> Duration {
-   let base_delay = Duration::from_secs(2);
-   let exponential = base_delay * (1 << retry_count.min(4));
-   let delay = exponential.min(MAX_AAP_RETRY_DELAY);
-   let jitter = rand::thread_rng().gen_range(0..1000);
-   delay + Duration::from_millis(jitter)
+   AAP_RETRY_DELAY
+      .saturating_mul(1_u32 << retry_count.min(6))
+      .min(MAX_AAP_RETRY_DELAY)
+      + Duration::from_millis(rand::thread_rng().gen_range(0..1000))
 }
 
 #[cfg(test)]
@@ -1253,5 +1256,27 @@ mod adapter_retry_tests {
          [5, 10, 20, 40, 80, 120, 120, 120].map(Duration::from_secs)
       );
       assert_eq!(adapter_retry_delay(u32::MAX), MAX_ADAPTER_RECOVERY_DELAY);
+   }
+
+   #[test]
+   fn aap_retry_backoff_reaches_its_cap() {
+      let jitter = Duration::from_secs(1);
+      for (retry_count, secs) in [
+         (1, 4),
+         (2, 8),
+         (3, 16),
+         (4, 32),
+         (5, 64),
+         (6, 120),
+         (7, 120),
+      ] {
+         let delay = calc_retry_delay(retry_count);
+         let base = Duration::from_secs(secs);
+         assert!(
+            delay >= base && delay < base + jitter,
+            "retry {retry_count}: {delay:?}"
+         );
+      }
+      assert!(calc_retry_delay(u32::MAX) < MAX_AAP_RETRY_DELAY + jitter);
    }
 }
