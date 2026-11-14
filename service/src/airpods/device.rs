@@ -365,7 +365,7 @@ impl AirPods {
          });
 
       let (receiver, sender) = l2cap::connect(jset, hooks, self.address(), None).await?;
-      info!("Starting handshake sequence...");
+      debug!("Starting handshake sequence...");
 
       // Send handshake
       if let Err(e) = sender.send(PKT_HANDSHAKE).await {
@@ -374,7 +374,7 @@ impl AirPods {
       } else if let Err(e) = wait_for_ack(&mut hs_ack_rx).await {
          warn!("No handshake acknowledgment received ({e:?}), continuing anyway...");
       } else {
-         info!("Handshake acknowledged");
+         debug!("Handshake acknowledged");
       }
 
       // Send features
@@ -384,7 +384,7 @@ impl AirPods {
       } else if let Err(e) = wait_for_ack(&mut feat_ack_rx).await {
          warn!("No features acknowledgment received ({e:?}), continuing anyway...");
       } else {
-         info!("Features acknowledged");
+         debug!("Features acknowledged");
       }
 
       // Request notifications
@@ -509,11 +509,9 @@ impl AirPods {
 
                // Send event if battery changed
                if self.update_battery_info(battery).is_updated() {
-                  self
-                     .0
-                     .battery_tracker
-                     .lock()
-                     .record_battery_drop(battery.left, battery.right);
+                  // split_ref yields the headphone battery for AirPods Max
+                  let (l, r) = battery.split_ref();
+                  self.0.battery_tracker.lock().record_battery_drop(*l, *r);
                   event_tx.emit(self, AirPodsEvent::BatteryUpdated(battery));
                }
             },
@@ -594,7 +592,8 @@ impl AirPods {
 
    /// Estimates battery time-to-live in minutes based on current levels and drain rate.
    pub fn estimate_battery_ttl(&self) -> Option<u32> {
-      const DEFAULT_DRAIN_RATE: f64 = 16.9; // 16.9%/hr
+      const EARBUDS_DEFAULT_DRAIN_RATE: f64 = 16.9; // %/hr
+      const HEADPHONE_DEFAULT_DRAIN_RATE: f64 = 5.0; // %/hr, ~20 h rated listening
 
       let battery = self.battery_info()?;
       let mode = self.noise_mode();
@@ -606,10 +605,16 @@ impl AirPods {
          .lock()
          .estimate_ttl(&battery, mode, self.address())
          .or_else(|| {
-            // Default to 16.9%/hr drain rate if no estimate available
-            let min_level = f64::from(battery.left.level.min(battery.right.level));
-            let hours_remaining = min_level / DEFAULT_DRAIN_RATE;
-            Some((hours_remaining * 60.0) as u32)
+            // Default drain rate until local/historical data is available
+            let default_rate = if battery.headphone.is_available() {
+               HEADPHONE_DEFAULT_DRAIN_RATE
+            } else {
+               EARBUDS_DEFAULT_DRAIN_RATE
+            };
+            let (left, right) = battery.split_ref();
+            let min_level = f64::from(left.level.min(right.level));
+            let minutes = (min_level / default_rate * 60.0) as u32;
+            (minutes > 0).then_some(minutes)
          })
    }
 

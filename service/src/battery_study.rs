@@ -542,7 +542,7 @@ impl BatteryTracker {
          (rate, alpha)
       } else {
          if prev_estimate.is_some() {
-            info!("Battery TTL estimation unavailable: No drain rate available");
+            debug!("Battery TTL estimation unavailable: No drain rate available");
             self.last_ttl_estimate = None;
          }
          return None;
@@ -1114,5 +1114,26 @@ mod tests {
       // Note: In real usage, time would have passed between samples
       // The test will likely still return false because not enough time has elapsed
       // This is expected behavior
+   }
+
+   #[test]
+   fn test_battery_tracker_records_headphone() {
+      let mut tracker = BatteryTracker::new(None);
+
+      // AirPods Max: only the headphone battery is available
+      for i in 0..5 {
+         let battery = BatteryInfo {
+            left: BatteryState::new(),
+            right: BatteryState::new(),
+            case: BatteryState::new(),
+            headphone: mock_state((100 - i) as u8, false),
+         };
+         let (l, r) = battery.split_ref();
+         tracker.record_battery_drop(*l, *r);
+      }
+
+      // Headphone level feeds the drain history
+      assert!(!tracker.left_history.is_empty());
+      assert!(!tracker.right_history.is_empty());
    }
 }

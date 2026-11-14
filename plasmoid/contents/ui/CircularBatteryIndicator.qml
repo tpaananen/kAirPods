@@ -15,6 +15,8 @@ Item {
     property bool showEarStatus: false
     // Flags this earbud as the one lagging behind its pair (L/R drift)
     property bool highlightLevel: false
+    // Shown right of the bottom percentage when non-empty
+    property string sideText: ""
 
     width: size
     height: size + Kirigami.Units.gridUnit * 0.8 // Extra space for bottom percentage
@@ -248,9 +250,11 @@ Item {
         }
     }
 
-    // Bottom percentage text
+    // Bottom percentage text; shifted left so it and sideText center as a pair
     Text {
+        id: levelText
         anchors.horizontalCenter: parent.horizontalCenter
+        anchors.horizontalCenterOffset: sideLabel.visible ? -(sideLabel.width + sideLabel.anchors.leftMargin) / 2 : 0
         anchors.bottom: parent.bottom
         anchors.bottomMargin: size * -0.2
         text: i18nc("Battery level; %1 is a percentage", "%1%", level)
@@ -263,6 +267,20 @@ Item {
         Behavior on color {
             ColorAnimation { duration: 300 }
         }
+    }
+
+    // Optional secondary info right of the percentage (e.g. time left)
+    Text {
+        id: sideLabel
+        visible: sideText !== ""
+        anchors.left: levelText.right
+        anchors.leftMargin: Kirigami.Units.largeSpacing
+        anchors.baseline: levelText.baseline
+        text: sideText
+        font.pixelSize: Kirigami.Units.gridUnit * 0.6
+        font.weight: Font.Light
+        color: Kirigami.Theme.textColor
+        opacity: 0.6
     }
 
     // Interactive hover effect
