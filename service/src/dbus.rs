@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt, str::FromStr};
 
 use bluer::Address;
-use log::info;
+use log::{debug, info};
 use zbus::{fdo, interface, object_server::SignalEmitter, zvariant};
 
 use crate::{
@@ -132,7 +132,7 @@ impl AirPodsService {
 
    async fn set_auto_play_pause(&self, enabled: bool) -> fdo::Result<bool> {
       media_control::set_enabled(enabled);
-      info!("Auto play/pause set to {enabled}");
+      debug!("Auto play/pause set to {enabled}");
       Ok(true)
    }
 
