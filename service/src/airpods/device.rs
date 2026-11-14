@@ -649,13 +649,18 @@ impl AirPods {
          .lock()
          .estimate_ttl(battery, mode, self.address())
          .or_else(|| {
+            // Nothing is draining while charging: the tracker has no estimate on purpose
+            let (left, right) = battery.split_ref();
+            if left.is_charging() || right.is_charging() {
+               return None;
+            }
+
             // Default drain rate until local/historical data is available
             let default_rate = if battery.headphone.is_available() {
                HEADPHONE_DEFAULT_DRAIN_RATE
             } else {
                EARBUDS_DEFAULT_DRAIN_RATE
             };
-            let (left, right) = battery.split_ref();
             let min_level = f64::from(left.level.min(right.level));
             let minutes = (min_level / default_rate * 60.0) as u32;
             (minutes > 0).then_some(minutes)
@@ -775,18 +780,29 @@ mod tests {
       }
    }
 
+   /// Battery report with one `(component, level, status)` entry per component.
+   fn battery_packet(entries: &[(Component, u8, BatteryStatus)]) -> Packet {
+      let mut packet = Packet::from_slice(HDR_BATTERY_STATE);
+      packet.push(entries.len() as u8);
+      for &(component, level, status) in entries {
+         packet.extend([component as u8, 0x01, level, status as u8, 0x01]);
+      }
+      packet
+   }
+
    #[tokio::test]
    async fn battery_estimate_changes_on_reports_not_on_reads() {
       let device = AirPods::new(Address::default(), "test".into(), None, None);
       let event_tx: EventSender = Arc::new(RecordedEvents::default());
-      let report = |left: u8, right: u8| {
-         // Left and right, discharging
-         let packet = Packet::from_slice(&[
-            0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x02, 0x04, 0x01, left, 0x02, 0x01, 0x02, 0x01,
-            right, 0x02, 0x01,
+      let report_with_status = |left: u8, left_status: BatteryStatus, right: u8| {
+         let packet = battery_packet(&[
+            (Component::Left, left, left_status),
+            (Component::Right, right, BatteryStatus::Discharging),
          ]);
          device.process_packet(device.address(), packet, &event_tx);
       };
+      let report =
+         |left: u8, right: u8| report_with_status(left, BatteryStatus::Discharging, right);
       assert_eq!(device.battery_ttl_estimate(), None);
 
       report(80, 85);
@@ -798,6 +814,15 @@ mod tests {
 
       report(70, 85);
       assert!(device.battery_ttl_estimate() < estimate);
+
+      // A charging bud has no time left to report, not even from the default rate
+      report_with_status(70, BatteryStatus::Charging, 85);
+      assert_eq!(device.battery_ttl_estimate(), None);
+      assert_eq!(device.to_json()["battery_ttl_estimate"], json!(null));
+
+      // The estimate returns once nothing is charging
+      report(90, 85);
+      assert!(device.battery_ttl_estimate().is_some());
 
       device.disconnect().await;
       assert_eq!(device.battery_ttl_estimate(), None);
