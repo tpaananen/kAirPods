@@ -135,6 +135,17 @@ impl ManagedDevice {
       }
    }
 
+   /// Records that the Bluetooth link is down, and closes AAP with it.
+   ///
+   /// AAP cannot outlive the link: close it now instead of leaving the device reported
+   /// as connected until the socket notices. Pending reconnects are cancelled, because an
+   /// L2CAP connect without a link would page the device and pull it onto this computer.
+   async fn mark_bluetooth_disconnected(&mut self, event_tx: &EventSender) {
+      self.bluetooth_state = BluetoothState::Disconnected;
+      self.aap_state = AAPState::Disconnected;
+      self.close_aap(event_tx).await;
+   }
+
    /// Whether the manager should establish the AAP connection on its own.
    fn wants_aap(&self) -> bool {
       self.bluetooth_state == BluetoothState::Connected
@@ -756,11 +767,12 @@ impl ManagerActor {
       info.next_retry = Some(time::Instant::now() + adapter_retry_delay(info.retry_count));
       info.retry_count = info.retry_count.saturating_add(1);
 
-      // Close the AAP connections on this adapter and mark them as failed
+      // A lost adapter has no links: close AAP on its devices and mark them failed. When
+      // the adapter returns, the device monitors report the devices that are connected.
       for device in self.devices.values_mut() {
          if device.adapter_name == name {
+            device.mark_bluetooth_disconnected(&self.event_tx).await;
             device.aap_state = AAPState::Failed("Adapter lost");
-            device.close_aap(&self.event_tx).await;
             self
                .event_tx
                .emit(&device.device, AirPodsEvent::DeviceError);
@@ -862,11 +874,7 @@ impl ManagerActor {
       if let Some(device) = self.devices.get_mut(&addr)
          && device.bluetooth_state == BluetoothState::Connected
       {
-         device.bluetooth_state = BluetoothState::Disconnected;
-         device.aap_state = AAPState::Disconnected;
-         // AAP cannot outlive the Bluetooth link: close it now instead of leaving the
-         // device reported as connected until the socket notices
-         device.close_aap(&self.event_tx).await;
+         device.mark_bluetooth_disconnected(&self.event_tx).await;
       }
    }
 
@@ -995,6 +1003,14 @@ impl ManagerActor {
       let bluer_device = adapter_info.adapter.device(addr)?;
       if !bluer_device.is_paired().await.unwrap_or(false) {
          return Err(AirPodsError::DeviceNotPaired);
+      }
+
+      // The cached state can be stale (missed event, adapter restart). Connecting AAP
+      // without a link would page the device, so ask BlueZ.
+      if !bluer_device.is_connected().await? {
+         debug!("{addr} has no Bluetooth link, not connecting AAP");
+         device.mark_bluetooth_disconnected(&self.event_tx).await;
+         return Err(AirPodsError::DeviceNotConnected);
       }
 
       // This attempt replaces a pending retry and any earlier task
@@ -1215,6 +1231,8 @@ fn calc_retry_delay(retry_count: u32) -> Duration {
 
 #[cfg(test)]
 mod managed_device_tests {
+   use std::sync::Arc;
+
    use super::*;
 
    fn managed_device() -> ManagedDevice {
@@ -1256,6 +1274,34 @@ mod managed_device_tests {
       device.user_disconnected = false;
       device.bluetooth_state = BluetoothState::Disconnected;
       assert!(!device.wants_aap());
+   }
+
+   #[tokio::test]
+   async fn lost_link_cancels_reconnect_and_stays_down() {
+      let mut device = managed_device();
+      let retry = tokio::spawn(std::future::pending::<()>());
+      let task = retry.abort_handle();
+      device.retry_handle = Some(retry);
+      device.aap_state = AAPState::WaitingToReconnect;
+      device.aap_attempt = 3;
+
+      let event_tx: EventSender = Arc::new(NoEvents);
+      device.mark_bluetooth_disconnected(&event_tx).await;
+
+      assert_eq!(device.bluetooth_state, BluetoothState::Disconnected);
+      assert_eq!(device.aap_state, AAPState::Disconnected);
+      assert!(device.retry_handle.is_none() && device.aap_attempt == 0);
+      assert!(!device.wants_aap());
+      for _ in 0..10 {
+         tokio::task::yield_now().await;
+      }
+      assert!(task.is_finished());
+   }
+
+   struct NoEvents;
+
+   impl crate::event::EventBus for NoEvents {
+      fn emit(&self, _device: &AirPods, _event: AirPodsEvent) {}
    }
 
    #[tokio::test]
