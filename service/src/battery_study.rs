@@ -61,6 +61,11 @@ const MAX_STUDY_SAMPLES: u32 = 200;
 ///
 /// Smaller rises are treated as measurement wobble and ignored.
 const RECHARGE_MIN_RISE: u8 = 3;
+/// Highest believable drain rate, in percent per hour (a full charge lasting 2 hours).
+///
+/// Faster rates come from history that spans a gap the clock did not see, such as a
+/// suspend, and are ignored rather than used or stored.
+const MAX_PLAUSIBLE_DRAIN_RATE: f64 = 50.0;
 
 static BASE_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 
@@ -184,6 +189,10 @@ impl BatteryHistory {
          None
       } else {
          let rate = calculate_slope(&samples)?;
+         if rate > MAX_PLAUSIBLE_DRAIN_RATE {
+            debug!("Ignoring implausible drain rate of {rate:.1}%/hr");
+            return None;
+         }
          let alpha = if samples.len() >= 10 { 0.3 } else { 0.1 };
          Some((rate, alpha))
       }
@@ -405,6 +414,11 @@ impl BatteryStudy {
       };
 
       if let Some(stats) = study.drain_rates.get(mode) {
+         // Stored by earlier versions from history that spanned a suspend
+         if stats.rate > MAX_PLAUSIBLE_DRAIN_RATE {
+            return Ok(None);
+         }
+
          // Calculate 95% confidence interval
          let samples = stats.samples.min(MAX_STUDY_SAMPLES);
          let confidence = if samples > 1 {
@@ -857,6 +871,19 @@ impl BatteryTracker {
       self.trim_history();
    }
 
+   /// Saves the drain data of a connection that ended and starts the next one afresh.
+   ///
+   /// Samples from different connections must not be combined: the time in between,
+   /// such as a suspend, is not visible to the monotonic clock, so the levels lost in
+   /// that time would look like a sudden drain.
+   pub fn end_session(&mut self, address: Address, noise_mode: NoiseControlMode) {
+      self.save_to_study(address, noise_mode);
+      self.left_history.clear();
+      self.right_history.clear();
+      self.last_ttl_estimate = None;
+      self.last_save = None;
+   }
+
    /// Trims battery history keeping only recent samples for continuity.
    fn trim_history(&mut self) {
       const KEEP_COUNT: usize = 5;
@@ -1276,6 +1303,62 @@ mod tests {
       assert!((rate - 15.0).abs() < 0.001);
       assert!(confidence > 0.1); // Not collapsed by the inflated count
 
+      Ok(())
+   }
+
+   #[test]
+   fn test_session_end_saves_and_forgets_history() -> Result<()> {
+      let (study, _dir) = create_test_db()?;
+      study.get_or_create_study(TEST_ADDRESS, SmolStr::new_static("Test AirPods"))?;
+      let mut tracker = BatteryTracker::new(Some(study.clone()));
+
+      // One 1% drop every 3.5 minutes (~17%/hr)
+      let base_time = Instant::now();
+      for i in 0..6 {
+         let timestamp = base_time + Duration::from_secs(i * 210);
+         tracker.left_history.push(timestamp, 80 - i as u8);
+         tracker.right_history.push(timestamp, 80 - i as u8);
+      }
+      tracker.last_ttl_estimate = Some(200);
+
+      tracker.end_session(TEST_ADDRESS, NoiseControlMode::Off);
+
+      assert!(
+         study
+            .get_drain_rate(TEST_ADDRESS, NoiseControlMode::Off)?
+            .is_some()
+      );
+      assert!(tracker.left_history.is_empty() && tracker.right_history.is_empty());
+      assert!(tracker.last_ttl_estimate.is_none() && tracker.last_save.is_none());
+
+      // After a suspend the next connection reports a much lower level: it starts a new
+      // history instead of extending the old one into a sudden drop
+      tracker.record_battery_drop(mock_state(60, false), mock_state(60, false));
+      assert_eq!(tracker.left_history.len(), 1);
+      Ok(())
+   }
+
+   #[test]
+   fn test_implausible_drain_rate_is_ignored() -> Result<()> {
+      // Steady drain, then a 20-point drop the clock saw as 60 seconds (a suspend)
+      let mut history = BatteryHistory::default();
+      let base_time = Instant::now();
+      for i in 0..5 {
+         history.push(base_time + Duration::from_secs(i * 210), 80 - i as u8);
+      }
+      assert!(history.calculate_drain_rate(4, None).is_some());
+      history.push(base_time + Duration::from_secs(900), 60);
+      assert!(history.calculate_drain_rate(4, None).is_none());
+
+      // Inflated rates stored by earlier versions are not used either
+      let (study, _dir) = create_test_db()?;
+      study.get_or_create_study(TEST_ADDRESS, SmolStr::new_static("Test AirPods"))?;
+      study.update_drain_rate(TEST_ADDRESS, NoiseControlMode::Off, 68.6, 10)?;
+      assert!(
+         study
+            .get_drain_rate(TEST_ADDRESS, NoiseControlMode::Off)?
+            .is_none()
+      );
       Ok(())
    }
 

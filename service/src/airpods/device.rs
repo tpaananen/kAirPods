@@ -349,7 +349,7 @@ impl AirPods {
    /// Updates the device state after its connection was dropped. Call with `conn` locked.
    fn mark_disconnected(&self) {
       // Save battery study data collected over the connection (reads the noise mode)
-      self.save_battery_study();
+      self.end_battery_session();
 
       self.0.is_connected.store(false, Ordering::Relaxed);
       self.0.connected_since.store(None);
@@ -655,14 +655,14 @@ impl AirPods {
          })
    }
 
-   /// Saves the current battery study data to the database.
-   fn save_battery_study(&self) {
+   /// Saves the battery study data of the connection that ended and forgets it.
+   fn end_battery_session(&self) {
       let mode = self.noise_mode().unwrap_or_default();
       self
          .0
          .battery_tracker
          .lock()
-         .save_to_study(self.address(), mode);
+         .end_session(self.address(), mode);
    }
 
    /// Checks if enough time has passed and samples collected to warrant a periodic save.
