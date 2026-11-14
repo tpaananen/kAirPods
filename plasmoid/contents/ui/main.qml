@@ -160,18 +160,26 @@ PlasmoidItem {
     // ------------------------------------------------------------------
     function updateDevicesList(deviceList) {
         var newDevices = {}
+        var firstAddress = ""
+        var firstConnected = ""
         for (var i = 0; i < deviceList.length; ++i) {
             var d = deviceList[i]
-            if (d && d.address)
+            if (d && d.address) {
                 newDevices[d.address] = d
+                if (!firstAddress)
+                    firstAddress = d.address
+                if (!firstConnected && d.connected)
+                    firstConnected = d.address
+            }
         }
         devices = newDevices
 
-        if (!selectedDevice && deviceList.length > 0)
-            selectedDevice = deviceList[0].address
-
-        if (selectedDevice && !devices.hasOwnProperty(selectedDevice))
-            selectedDevice = ""
+        // Keep the selection while it is listed and connected. If it was removed
+        // or disconnected, switch to a connected device right away (a disconnected
+        // device only shows "No device connected"), falling back to any device.
+        var selected = newDevices[selectedDevice]
+        if (!selected || (!selected.connected && firstConnected))
+            selectedDevice = firstConnected || firstAddress
     }
 
     // ------------------------------------------------------------------

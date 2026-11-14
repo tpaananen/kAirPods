@@ -132,7 +132,55 @@ Item {
                     Component {
                         id: comboBoxComponent
                         PlasmaComponents3.ComboBox {
+                            id: deviceCombo
                             Layout.fillWidth: true
+
+                            // Use Plasma theme colors explicitly so the popup background
+                            // and item text always come from the same palette.
+                            delegate: PlasmaComponents3.ItemDelegate {
+                                id: deviceDelegate
+                                required property var modelData
+                                required property int index
+                                width: ListView.view ? ListView.view.width : deviceCombo.width
+                                highlighted: deviceCombo.highlightedIndex === index
+                                contentItem: PlasmaComponents3.Label {
+                                    text: deviceDelegate.modelData.text
+                                    elide: Text.ElideRight
+                                    color: deviceDelegate.highlighted
+                                        ? Kirigami.Theme.highlightedTextColor
+                                        : Kirigami.Theme.textColor
+                                }
+                                background: Rectangle {
+                                    color: deviceDelegate.highlighted
+                                        ? Kirigami.Theme.highlightColor
+                                        : "transparent"
+                                    radius: Kirigami.Units.smallSpacing
+                                }
+                            }
+
+                            popup.background: Rectangle {
+                                color: Kirigami.Theme.backgroundColor
+                                border.width: 1
+                                border.color: Kirigami.ColorUtils.adjustColor(
+                                    Kirigami.Theme.textColor,
+                                    {"alpha": -200}
+                                )
+                                radius: Kirigami.Units.smallSpacing
+                            }
+
+                            // Closed-state box: same theme background as the popup,
+                            // with the border highlighted on hover/focus/open.
+                            background: Rectangle {
+                                implicitHeight: Kirigami.Units.gridUnit * 1.6
+                                color: deviceCombo.pressed
+                                    ? Kirigami.ColorUtils.adjustColor(Kirigami.Theme.backgroundColor, {"value": -8})
+                                    : Kirigami.Theme.backgroundColor
+                                border.width: 1
+                                border.color: (deviceCombo.hovered || deviceCombo.visualFocus || deviceCombo.popup.visible)
+                                    ? Kirigami.Theme.highlightColor
+                                    : Kirigami.ColorUtils.adjustColor(Kirigami.Theme.textColor, {"alpha": -200})
+                                radius: Kirigami.Units.smallSpacing
+                            }
                             enabled: Object.keys(devices).length > 0
 
                             model: {
@@ -181,9 +229,12 @@ Item {
                                 return 0
                             }
 
-                            onCurrentValueChanged: {
-                                if (currentValue !== selectedDevice) {
-                                    deviceSelected(currentValue)
+                            // Only react to the user picking an entry; currentValue also
+                            // changes while the model is rebuilt on device-list updates.
+                            onActivated: function (index) {
+                                var address = valueAt(index)
+                                if (address && address !== selectedDevice) {
+                                    deviceSelected(address)
                                 }
                             }
                         }

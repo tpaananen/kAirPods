@@ -788,7 +788,7 @@ impl BatteryTracker {
          {
             // Update drain rate statistics in the database
             let _ = study.update_drain_rate(address, noise_mode, drain_rate, sample_count as u32);
-            info!(
+            debug!(
                "Saved battery drain rate of {drain_rate:.1}%/hr for mode {noise_mode} with {sample_count} samples"
             );
 
