@@ -69,6 +69,8 @@ struct AirPodsInner {
    /// The right earbud is the primary one, as last seen in a battery report
    right_is_primary: AtomicBool,
    noise_mode: AtomicCell<Option<NoiseControlMode>>,
+   /// Battery time remaining in minutes, recalculated on each battery report
+   battery_ttl: AtomicCell<Option<u32>>,
    product_id: Option<u32>,
    features: FeatureBitmap,
    features_present: FeatureBitmap,
@@ -238,7 +240,7 @@ impl AirPods {
       }
 
       // Add battery TTL estimate
-      info["battery_ttl_estimate"] = match self.estimate_battery_ttl() {
+      info["battery_ttl_estimate"] = match self.battery_ttl_estimate() {
          Some(minutes) => json!(minutes),
          None => json!(null),
       };
@@ -359,6 +361,7 @@ impl AirPods {
       self.0.battery.store(None);
       self.0.noise_mode.store(None);
       self.0.ear_detection.store(None);
+      self.0.battery_ttl.store(None);
       info!("Disconnected from {}", self.address());
    }
 
@@ -548,6 +551,7 @@ impl AirPods {
                   // split_ref yields the headphone battery for AirPods Max
                   let (l, r) = battery.split_ref();
                   self.0.battery_tracker.lock().record_battery_drop(*l, *r);
+                  self.refresh_battery_ttl(&battery);
                   event_tx.emit(self, AirPodsEvent::BatteryUpdated(battery));
                }
             },
@@ -627,20 +631,27 @@ impl AirPods {
       }
    }
 
-   /// Estimates battery time-to-live in minutes based on current levels and drain rate.
-   pub fn estimate_battery_ttl(&self) -> Option<u32> {
+   /// Battery time remaining in minutes, as of the last battery report.
+   pub fn battery_ttl_estimate(&self) -> Option<u32> {
+      self.0.battery_ttl.load()
+   }
+
+   /// Recalculates the battery time remaining from a new battery report.
+   ///
+   /// Each call moves the smoothed estimate one step, so it must run once per report,
+   /// never on reads.
+   fn refresh_battery_ttl(&self, battery: &BatteryInfo) {
       const EARBUDS_DEFAULT_DRAIN_RATE: f64 = 16.9; // %/hr
       const HEADPHONE_DEFAULT_DRAIN_RATE: f64 = 5.0; // %/hr, ~20 h rated listening
 
-      let battery = self.battery_info()?;
       let mode = self.noise_mode();
 
       // Get estimate from battery tracker, or use default
-      self
+      let ttl = self
          .0
          .battery_tracker
          .lock()
-         .estimate_ttl(&battery, mode, self.address())
+         .estimate_ttl(battery, mode, self.address())
          .or_else(|| {
             // Default drain rate until local/historical data is available
             let default_rate = if battery.headphone.is_available() {
@@ -652,7 +663,8 @@ impl AirPods {
             let min_level = f64::from(left.level.min(right.level));
             let minutes = (min_level / default_rate * 60.0) as u32;
             (minutes > 0).then_some(minutes)
-         })
+         });
+      self.0.battery_ttl.store(ttl);
    }
 
    /// Saves the battery study data of the connection that ended and forgets it.
@@ -765,6 +777,34 @@ mod tests {
       for key in ["battery", "noise_mode", "ear_detection"] {
          assert!(json.get(key).is_none(), "{key} survived the disconnect");
       }
+   }
+
+   #[tokio::test]
+   async fn battery_estimate_changes_on_reports_not_on_reads() {
+      let device = AirPods::new(Address::default(), "test".into(), None, None);
+      let event_tx: EventSender = Arc::new(RecordedEvents::default());
+      let report = |left: u8, right: u8| {
+         // Left and right, discharging
+         let packet = Packet::from_slice(&[
+            0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x02, 0x04, 0x01, left, 0x02, 0x01, 0x02, 0x01,
+            right, 0x02, 0x01,
+         ]);
+         device.process_packet(device.address(), packet, &event_tx);
+      };
+      assert_eq!(device.battery_ttl_estimate(), None);
+
+      report(80, 85);
+      let estimate = device.battery_ttl_estimate();
+      assert!(estimate.is_some());
+      for _ in 0..5 {
+         assert_eq!(device.to_json()["battery_ttl_estimate"], json!(estimate));
+      }
+
+      report(70, 85);
+      assert!(device.battery_ttl_estimate() < estimate);
+
+      device.disconnect().await;
+      assert_eq!(device.battery_ttl_estimate(), None);
    }
 
    #[tokio::test]
