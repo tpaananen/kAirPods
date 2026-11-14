@@ -356,11 +356,17 @@ impl AirPods {
 
    /// Updates the device state after its connection was dropped. Call with `conn` locked.
    fn mark_disconnected(&self) {
-      // Save battery study data collected over the connection
+      // Save battery study data collected over the connection (reads the noise mode)
       self.save_battery_study();
 
       self.0.is_connected.store(false, Ordering::Relaxed);
       self.0.connected_since.store(None);
+
+      // What the device reported is only valid for the connection that delivered it. The
+      // next connection starts without it and waits for fresh reports.
+      self.0.battery.store(None);
+      self.0.noise_mode.store(None);
+      self.0.ear_detection.store(None);
       info!("Disconnected from {}", self.address());
    }
 
@@ -564,8 +570,15 @@ impl AirPods {
                   status.is_right_in_ear()
                );
 
-               if self.update_ear_detection(status).is_updated() {
-                  event_tx.emit(self, AirPodsEvent::EarDetectionChanged(status));
+               let update = self.update_ear_detection(status);
+               if update.is_updated() {
+                  event_tx.emit(
+                     self,
+                     AirPodsEvent::EarDetectionChanged {
+                        status,
+                        first_report: matches!(update, UpdateOp::Inserted),
+                     },
+                  );
                }
             },
             Err(e) => warn!("Failed to parse ear detection: {e}"),
@@ -693,7 +706,7 @@ impl AirPods {
 #[cfg(test)]
 mod tests {
    use super::*;
-   use crate::event::EventBus;
+   use crate::{airpods::protocol::BatteryStatus, event::EventBus};
 
    #[tokio::test]
    async fn connected_since_is_serialized_and_cleared_on_disconnect() {
@@ -724,6 +737,60 @@ mod tests {
          jset: JoinSet::new(),
       });
       device.0.is_connected.store(true, Ordering::Relaxed);
+   }
+
+   #[tokio::test]
+   async fn reported_state_is_cleared_on_disconnect() {
+      let device = AirPods::new(Address::default(), "test".into(), None, None);
+      let mut battery = BatteryInfo::new();
+      battery.left.status = BatteryStatus::Normal;
+      device.update_battery_info(battery);
+      device.update_noise_mode(NoiseControlMode::Active);
+      device.update_ear_detection(EarDetectionStatus::new(true, true));
+
+      device.disconnect().await;
+
+      // A reconnect must wait for fresh reports instead of reusing these
+      assert!(device.battery_info().is_none());
+      assert!(device.noise_mode().is_none());
+      assert!(device.ear_detection().is_none());
+      let json = device.to_json();
+      for key in ["battery", "noise_mode", "ear_detection"] {
+         assert!(json.get(key).is_none(), "{key} survived the disconnect");
+      }
+   }
+
+   #[tokio::test]
+   async fn first_ear_detection_report_of_a_connection_is_flagged() {
+      let device = AirPods::new(Address::default(), "test".into(), None, None);
+      let events = Arc::new(RecordedEvents::default());
+      let event_tx: EventSender = events.clone();
+      let report = |left_out: u8, right_out: u8| {
+         let mut packet = Packet::from_slice(HDR_EAR_DETECTION);
+         packet.extend([left_out, right_out]);
+         device.process_packet(device.address(), packet, &event_tx);
+      };
+      let first_reports = || -> Vec<bool> {
+         events
+            .0
+            .lock()
+            .drain(..)
+            .map(|event| match event {
+               AirPodsEvent::EarDetectionChanged { first_report, .. } => first_report,
+               other => panic!("unexpected event {other:?}"),
+            })
+            .collect()
+      };
+
+      // Connected with both buds out, then both are put in
+      report(1, 1);
+      report(0, 0);
+      assert_eq!(first_reports(), [true, false]);
+
+      // The same state reported after a reconnect is a first report again
+      device.disconnect().await;
+      report(0, 0);
+      assert_eq!(first_reports(), [true]);
    }
 
    #[tokio::test]

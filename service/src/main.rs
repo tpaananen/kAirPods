@@ -7,7 +7,7 @@
 use std::{sync::Arc, time::Duration};
 
 use crossbeam::queue::SegQueue;
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::{
    select,
    signal::{self, unix::SignalKind},
@@ -256,7 +256,10 @@ impl EventProcessor {
                .devices_changed(iface.signal_emitter())
                .await?;
          },
-         AirPodsEvent::EarDetectionChanged(ear_detection) => {
+         AirPodsEvent::EarDetectionChanged {
+            status: ear_detection,
+            first_report,
+         } => {
             iface
                .ear_detection_changed(addr_str, &ear_detection.to_json().to_string())
                .await?;
@@ -268,9 +271,12 @@ impl EventProcessor {
                .await?;
 
             // Handle play/pause based on ear detection
-            // Pause when at least one earbud is removed, play only when both are in
+            // Pause when at least one earbud is removed, play only when both are in.
+            // Connecting alone must not touch playback, so the first report is skipped.
             let both_in_ear = ear_detection.is_left_in_ear() && ear_detection.is_right_in_ear();
-            if both_in_ear {
+            if first_report {
+               debug!("Initial ear detection state for {addr_str}, leaving playback alone");
+            } else if both_in_ear {
                // Both AirPods are in ear - send play command
                media_control::send_play().await;
             } else {

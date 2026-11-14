@@ -21,7 +21,11 @@ pub enum AirPodsEvent {
    DeviceError,
    BatteryUpdated(BatteryInfo),
    NoiseControlChanged(NoiseControlMode),
-   EarDetectionChanged(EarDetectionStatus),
+   EarDetectionChanged {
+      status: EarDetectionStatus,
+      /// First report of a connection: the state became known, nothing changed in the ears
+      first_report: bool,
+   },
    DeviceNameChanged(SmolStr),
 }
 
