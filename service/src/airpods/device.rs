@@ -782,13 +782,21 @@ impl AirPods {
    }
 
    /// Performs a periodic save of battery study data if conditions are met.
+   ///
+   /// The tracker is not held during the write, which waits for the disk: the packet
+   /// processor records battery reports meanwhile, and a disconnect is not held up.
    fn periodic_battery_save(&self) {
       let mode = self.noise_mode().unwrap_or_default();
-      self
+      let begun = self
          .0
          .battery_tracker
          .lock()
-         .save_to_study(self.address(), mode);
+         .begin_save(self.address(), mode);
+      if let Some((pending, mark)) = begun
+         && pending.write()
+      {
+         self.0.battery_tracker.lock().finish_save(mark);
+      }
    }
 
    /// Performs all periodic tasks for the device.
@@ -1035,6 +1043,48 @@ mod tests {
 
       // The session is still saved, once the database is free
       device.flush_battery_writes().await;
+      assert!(
+         study
+            .get_drain_rate(Address::default(), NoiseControlMode::Off)
+            .unwrap()
+            .is_some()
+      );
+   }
+
+   #[test]
+   fn battery_report_does_not_wait_for_a_periodic_save() {
+      let (study, _dir) = BatteryStudy::open_temp();
+      study
+         .get_or_create_study(Address::default(), "test".into())
+         .unwrap();
+      let device = AirPods::new(Address::default(), "test".into(), None, Some(study.clone()));
+      device.0.battery_tracker.lock().record_test_drops(6);
+      let event_tx: EventSender = Arc::new(RecordedEvents::default());
+
+      // Another writer holds the database, as a slow disk would, while a save is due
+      let writer = study.hold_write_lock(Duration::from_millis(500));
+      let saver = std::thread::spawn({
+         let device = device.clone();
+         move || device.periodic_battery_save()
+      });
+      std::thread::sleep(Duration::from_millis(100));
+
+      // A report arrives on the packet processor meanwhile
+      let packet = battery_packet(&[
+         (Component::Left, 90, BatteryStatus::Discharging),
+         (Component::Right, 90, BatteryStatus::Discharging),
+      ]);
+      let started = std::time::Instant::now();
+      device.process_packet(device.address(), packet, &event_tx);
+      let waited = started.elapsed();
+      assert!(
+         waited < Duration::from_millis(250),
+         "battery report waited {waited:?}"
+      );
+      writer.join().unwrap();
+      saver.join().unwrap();
+
+      // The save still happened, once the database was free
       assert!(
          study
             .get_drain_rate(Address::default(), NoiseControlMode::Off)

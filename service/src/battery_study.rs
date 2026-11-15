@@ -515,6 +515,15 @@ impl PendingSave {
    }
 }
 
+/// What [`BatteryTracker::begin_save`] is saving, for [`BatteryTracker::finish_save`].
+#[derive(Debug, Clone, Copy)]
+pub struct SaveMark {
+   noise_mode: NoiseControlMode,
+   /// Samples written, from the unsaved count of the bud with the most
+   samples: usize,
+   session: u64,
+}
+
 /// Battery tracker that manages real-time battery monitoring and integrates with long-term study.
 #[derive(Debug, Default)]
 pub struct BatteryTracker {
@@ -525,6 +534,9 @@ pub struct BatteryTracker {
    /// When drain data was last written to the study database
    last_save: Option<Instant>,
    study: Option<BatteryStudy>,
+   /// Counts the sessions ended by [`Self::take_session`], so a save that finishes after
+   /// its session ended does not touch the next one
+   session: u64,
    // Cache for historical drain rates to reduce DB queries
    historical_cache: Mutex<NoiseControlMap<(f64, f64, Instant)>>, // (rate, confidence, last_updated)
 }
@@ -867,17 +879,49 @@ impl BatteryTracker {
    /// Saves aggregated battery drain data to the study database.
    ///
    /// Each sample is counted once: the drain rate is weighted by the samples recorded
-   /// since the last save, and nothing is written when there are none.
+   /// since the last save, and nothing is written when there are none. Writes while
+   /// borrowing the tracker; callers sharing it use [`Self::begin_save`] instead.
+   #[cfg(test)]
    pub fn save_to_study(&mut self, address: Address, noise_mode: NoiseControlMode) {
-      if let Some(pending) = self.pending_save(address, noise_mode) {
-         self.last_save = Some(Instant::now());
-         if pending.write() {
-            // Clear cache for this mode to force refresh
-            self.historical_cache.lock().remove(noise_mode);
+      if let Some((pending, mark)) = self.begin_save(address, noise_mode)
+         && pending.write()
+      {
+         self.finish_save(mark);
+      }
+   }
 
-            self.left_history.unsaved = 0;
-            self.right_history.unsaved = 0;
-         }
+   /// Starts a periodic save: returns the drain data to write, and the mark to pass to
+   /// [`Self::finish_save`] once it was written.
+   ///
+   /// The write waits for the disk, so the caller does it without holding the tracker:
+   /// battery reports keep being recorded meanwhile.
+   pub fn begin_save(
+      &mut self,
+      address: Address,
+      noise_mode: NoiseControlMode,
+   ) -> Option<(PendingSave, SaveMark)> {
+      let pending = self.pending_save(address, noise_mode)?;
+      self.last_save = Some(Instant::now());
+      let mark = SaveMark {
+         noise_mode,
+         samples: pending.new_samples as usize,
+         session: self.session,
+      };
+      Some((pending, mark))
+   }
+
+   /// Records that the data of [`Self::begin_save`] was written.
+   ///
+   /// Only the samples that were written count as saved: those recorded during the write
+   /// are saved next time. A save that outlived its session leaves the new one alone.
+   pub fn finish_save(&mut self, mark: SaveMark) {
+      // The next estimate reads the stored rate again
+      self.historical_cache.lock().remove(mark.noise_mode);
+      if mark.session != self.session {
+         return;
+      }
+      for history in [&mut self.left_history, &mut self.right_history] {
+         history.unsaved = history.unsaved.saturating_sub(mark.samples);
       }
    }
 
@@ -920,6 +964,7 @@ impl BatteryTracker {
       self.right_history.clear();
       self.last_drain_rate = None;
       self.last_save = None;
+      self.session = self.session.wrapping_add(1);
       pending
    }
 }
@@ -1376,6 +1421,49 @@ mod tests {
       assert_eq!(sample_count, 12);
       assert!((alpha - 0.3).abs() < f64::EPSILON);
       assert!((rate - 3600.0 / 210.0).abs() < 0.01, "rate {rate}");
+      Ok(())
+   }
+
+   #[test]
+   fn samples_recorded_during_a_save_are_saved_next_time() -> Result<()> {
+      let (study, _dir) = create_test_db()?;
+      study.get_or_create_study(TEST_ADDRESS, SmolStr::new_static("Test AirPods"))?;
+      let mut tracker = BatteryTracker::new(Some(study));
+      let base_time = Instant::now();
+
+      record_drops(&mut tracker, base_time, 0..6);
+      let (pending, mark) = tracker
+         .begin_save(TEST_ADDRESS, NoiseControlMode::Off)
+         .unwrap();
+
+      // A report arrives while the write waits for the disk
+      record_drops(&mut tracker, base_time, 6..7);
+      assert!(pending.write());
+      tracker.finish_save(mark);
+
+      assert_eq!(tracker.unsaved_samples(), 1);
+      Ok(())
+   }
+
+   #[test]
+   fn a_save_that_outlives_its_session_leaves_the_next_one_alone() -> Result<()> {
+      let (study, _dir) = create_test_db()?;
+      study.get_or_create_study(TEST_ADDRESS, SmolStr::new_static("Test AirPods"))?;
+      let mut tracker = BatteryTracker::new(Some(study));
+      let base_time = Instant::now();
+
+      record_drops(&mut tracker, base_time, 0..6);
+      let (pending, mark) = tracker
+         .begin_save(TEST_ADDRESS, NoiseControlMode::Off)
+         .unwrap();
+
+      // Disconnected and reconnected during the write
+      let _ = tracker.take_session(TEST_ADDRESS, NoiseControlMode::Off);
+      record_drops(&mut tracker, base_time, 0..3);
+      assert!(pending.write());
+      tracker.finish_save(mark);
+
+      assert_eq!(tracker.unsaved_samples(), 3);
       Ok(())
    }
 
