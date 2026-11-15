@@ -20,6 +20,8 @@ Card {
     readonly property bool showTtl: (device?.battery_ttl_estimate ?? 0) > 0
 
     title: i18n("Battery")
+    // Time left sits on the title line, for earbuds and AirPods Max alike
+    titleDetail: root.showTtl ? formatBatteryTime(device?.battery_ttl_estimate ?? 0) : ""
     implicitHeight: Kirigami.Units.gridUnit * 8
 
     function formatBatteryTime(minutes) {
@@ -49,10 +51,6 @@ Card {
                 spacing: Kirigami.Units.largeSpacing
                 Layout.fillWidth: true
 
-                readonly property real ringSize: Kirigami.Units.gridUnit * 3.5
-                // Earbuds: the TTL estimate sits between the L and R rings
-                readonly property bool ttlBetweenRings: root.showTtl && leftRing.visible && rightRing.visible
-
                 // Single headphone battery (AirPods Max)
                 CircularBatteryIndicator {
                     Layout.fillWidth: true
@@ -64,8 +62,6 @@ Card {
                     size: Kirigami.Units.gridUnit * 3.5
                     showEarStatus: true
                     inEar: !(!device?.ear_detection?.left_in_ear && !device?.ear_detection?.right_in_ear)
-                    // Single ring: time left sits on the percentage line
-                    sideText: root.showTtl ? formatBatteryTime(device?.battery_ttl_estimate ?? 0) : ""
                 }
 
                 // Left AirPod
@@ -81,30 +77,6 @@ Card {
                     showEarStatus: true
                     inEar: !!device?.ear_detection?.left_in_ear
                     highlightLevel: root.leftLagging
-                    // Only bud shown: time left sits on its percentage line
-                    sideText: root.showTtl && !rightRing.visible
-                              ? formatBatteryTime(device?.battery_ttl_estimate ?? 0) : ""
-
-                    // Battery TTL estimate, centered in the gap between the L
-                    // and R circles. Parented here to stay out of the layout;
-                    // coordinates are relative to this ring.
-                    Text {
-                        visible: ringRow.ttlBetweenRings
-                        readonly property real circleRight: (leftRing.width + ringRow.ringSize) / 2
-                        readonly property real gap: rightRing.x - leftRing.x
-                                                    + (rightRing.width - ringRow.ringSize) / 2 - circleRight
-                        width: Math.max(0, gap - Kirigami.Units.smallSpacing * 2)
-                        x: circleRight + (gap - width) / 2
-                        y: (ringRow.ringSize - height) / 2
-
-                        text: formatBatteryTime(device?.battery_ttl_estimate ?? 0)
-                        font.pixelSize: Kirigami.Units.gridUnit * 0.6
-                        font.weight: Font.Light
-                        color: Kirigami.Theme.textColor
-                        opacity: 0.6
-                        horizontalAlignment: Text.AlignHCenter
-                        elide: Text.ElideRight
-                    }
                 }
 
                 // Right AirPod
@@ -120,9 +92,6 @@ Card {
                     showEarStatus: true
                     inEar: !!device?.ear_detection?.right_in_ear
                     highlightLevel: root.rightLagging
-                    // Only bud shown: time left sits on its percentage line
-                    sideText: root.showTtl && !leftRing.visible
-                              ? formatBatteryTime(device?.battery_ttl_estimate ?? 0) : ""
                 }
 
                 // Charging case
@@ -137,8 +106,7 @@ Card {
                 }
             }
 
-            // L/R drift notice (TTL lives between the L/R rings, or on the
-            // AirPods Max percentage line)
+            // L/R drift notice
             Text {
                 Layout.alignment: Qt.AlignHCenter
                 Layout.topMargin: Kirigami.Units.smallSpacing

@@ -8,10 +8,16 @@ Item {
     
     property alias contentItem: contentLoader.sourceComponent
     property alias title: titleLabel.text
+    // Shown right-aligned on the title line when non-empty
+    property alias titleDetail: titleDetailLabel.text
     property bool showTitle: true
     property real cardRadius: Kirigami.Units.gridUnit * 0.6
     implicitWidth: 2 * Kirigami.Units.largeSpacing
-                   + Math.max(titleLabel.visible ? titleLabel.implicitWidth : 0,
+                   + Math.max(titleLabel.visible
+                              ? titleLabel.implicitWidth
+                                + (titleDetailLabel.visible
+                                   ? Kirigami.Units.largeSpacing + titleDetailLabel.implicitWidth : 0)
+                              : 0,
                               contentLoader.item ? contentLoader.item.implicitWidth : 0)
     implicitHeight: 2 * Kirigami.Units.largeSpacing
                     + (titleLabel.visible ? titleLabel.implicitHeight + Kirigami.Units.smallSpacing : 0)
@@ -82,16 +88,31 @@ Item {
         anchors.margins: Kirigami.Units.largeSpacing
         spacing: Kirigami.Units.smallSpacing
         
-        // Title
+        // Title, with an optional detail on the right of the same line
         Text {
             id: titleLabel
             visible: showTitle && text !== ""
-            width: parent.width
+            width: parent.width - (titleDetailLabel.visible
+                                   ? titleDetailLabel.implicitWidth + Kirigami.Units.largeSpacing : 0)
             font.pixelSize: Kirigami.Units.gridUnit * 0.7
             font.weight: Font.Medium
             color: Kirigami.Theme.textColor
             opacity: 0.7
+            elide: Text.ElideRight
             text: ""
+
+            Text {
+                id: titleDetailLabel
+                visible: titleLabel.visible && text !== ""
+                // Right edge of the card content, on the title's baseline
+                x: titleLabel.parent.width - implicitWidth
+                anchors.baseline: parent.baseline
+                font.pixelSize: Kirigami.Units.gridUnit * 0.6
+                font.weight: Font.Light
+                color: Kirigami.Theme.textColor
+                opacity: 0.85
+                text: ""
+            }
         }
         
         // Content loader
