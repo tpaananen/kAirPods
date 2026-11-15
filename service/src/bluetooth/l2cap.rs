@@ -88,6 +88,15 @@ impl L2CapSender {
 }
 
 #[cfg(test)]
+impl L2CapReceiver {
+   /// Receiver fed by the returned sender instead of a socket.
+   pub fn channel() -> (mpsc::Sender<Result<Packet>>, Self) {
+      let (tx, rx) = mpsc::channel(8);
+      (tx, Self { rx })
+   }
+}
+
+#[cfg(test)]
 impl L2CapSender {
    /// Sender without a socket behind it; every send fails with `ConnectionClosed`.
    pub fn disconnected() -> Self {

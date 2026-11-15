@@ -41,6 +41,8 @@ uuid = "1"
 
 [dev-dependencies]
 tempfile = "3.14"
+# Paused clock in tests
+tokio = { version = "1.47", features = ["test-util"] }
 
 [[bin]]
 name = "kairpodsd"

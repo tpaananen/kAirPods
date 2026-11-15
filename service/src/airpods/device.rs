@@ -41,6 +41,12 @@ use crate::{
    event::{AirPodsEvent, EventSender},
 };
 
+/// Time a new connection gets to send its first packet of any kind.
+///
+/// The handshake acknowledgments usually arrive at once. An AAP channel that opens but
+/// never answers stays silent: it is closed, so the manager reconnects.
+const FIRST_PACKET_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Internal state for an active L2CAP connection.
 #[derive(Debug)]
 struct ConnectionState {
@@ -480,8 +486,20 @@ impl AirPods {
       let weak = WeakAirPods::new(self);
       tokio::spawn(async move {
          let mut err = None;
+         let mut answered = false;
          loop {
-            match rx.recv().await {
+            let received = if answered {
+               rx.recv().await
+            } else {
+               time::timeout(FIRST_PACKET_TIMEOUT, rx.recv())
+                  .await
+                  .unwrap_or_else(|_| {
+                     warn!("{addr}: No packet within {FIRST_PACKET_TIMEOUT:?}, closing silent connection");
+                     Err(AirPodsError::RequestTimeout)
+                  })
+            };
+            answered |= received.is_ok();
+            match received {
                Ok(packet) => {
                   if let Some(this) = weak.upgrade() {
                      this.process_packet(addr, packet, &event_tx);
@@ -1023,6 +1041,52 @@ mod tests {
             .unwrap()
             .is_some()
       );
+   }
+
+   #[tokio::test(start_paused = true)]
+   async fn silent_connection_is_closed_so_it_can_be_retried() {
+      let device = AirPods::new(Address::default(), "test".into(), None, None);
+      let events = Arc::new(RecordedEvents::default());
+      let event_tx: EventSender = events.clone();
+      set_connection(&device, 1).await;
+
+      // The channel opens, but the AirPods never send anything
+      let (_packets, rx) = L2CapReceiver::channel();
+      let processor = device.start_packet_processor(1, rx, event_tx);
+      let ended = time::timeout(Duration::from_secs(60), processor)
+         .await
+         .expect("a connection that never answers must not stay open")
+         .unwrap();
+
+      // Ended with an error, so the manager retries it
+      assert!(matches!(ended, Some(AirPodsError::RequestTimeout)));
+      assert!(!device.is_connected());
+      assert!(matches!(
+         events.0.lock().as_slice(),
+         [AirPodsEvent::DeviceDisconnected]
+      ));
+   }
+
+   #[tokio::test(start_paused = true)]
+   async fn connection_that_answers_stays_open_through_quiet_periods() {
+      let device = AirPods::new(Address::default(), "test".into(), None, None);
+      let event_tx: EventSender = Arc::new(RecordedEvents::default());
+      set_connection(&device, 1).await;
+
+      let (packets, rx) = L2CapReceiver::channel();
+      let mut processor = device.start_packet_processor(1, rx, event_tx);
+      packets
+         .send(Ok(Packet::from_slice(HDR_ACK_HANDSHAKE)))
+         .await
+         .unwrap();
+
+      // Long stretches without packets are normal once the AirPods have answered
+      assert!(
+         time::timeout(Duration::from_secs(600), &mut processor)
+            .await
+            .is_err()
+      );
+      assert!(device.is_connected());
    }
 
    #[tokio::test]
