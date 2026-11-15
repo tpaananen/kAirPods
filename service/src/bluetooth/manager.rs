@@ -155,6 +155,27 @@ impl ManagedDevice {
       self.close_aap(event_tx).await;
    }
 
+   /// Takes the name and product id that `BlueZ` reports now, replacing the device if
+   /// either changed. Returns whether it did.
+   ///
+   /// Both are fixed in the device, so a rename or a product id that was unknown at first
+   /// sight needs a new one. That is done only while AAP is closed: the device holds the
+   /// connection. The manager's own state for the device is kept.
+   fn refresh_identity(
+      &mut self,
+      name: String,
+      product_id: Option<u32>,
+      battery_study: Option<BatteryStudy>,
+   ) -> bool {
+      if self.device.is_connected()
+         || (*self.device.name() == name && self.device.product_id() == product_id)
+      {
+         return false;
+      }
+      self.device = AirPods::new(self.device.address(), name, product_id, battery_study);
+      true
+   }
+
    /// Whether the manager should establish the AAP connection on its own.
    fn wants_aap(&self) -> bool {
       self.bluetooth_state == BluetoothState::Connected
@@ -977,16 +998,10 @@ impl ManagerActor {
          return;
       }
 
-      let name = device
-         .name()
-         .await
-         .ok()
-         .flatten()
-         .unwrap_or_else(|| addr.to_string());
+      let (name, product_id) = device_identity(&device).await;
       info!("Found connected AirPods: {name} ({addr})");
 
       // Create managed device
-      let product_id = airpods::recognition::product_id(&device).await;
       let airpods = AirPods::new(addr, name, product_id, self.battery_study.clone());
       let managed = ManagedDevice {
          device: airpods,
@@ -1021,6 +1036,25 @@ impl ManagerActor {
       device.bluetooth_state = BluetoothState::Connected;
       // A new Bluetooth session connects automatically again
       device.user_disconnected = false;
+      // The link may be up on another adapter than before
+      device.adapter_name = adapter_name;
+
+      // Renamed, or a product id unknown before: take what BlueZ reports now
+      if let Some(bluer_device) = self
+         .adapters
+         .get(&device.adapter_name)
+         .and_then(|info| info.adapter.device(addr).ok())
+      {
+         let (name, product_id) = device_identity(&bluer_device).await;
+         if device.refresh_identity(name, product_id, self.battery_study.clone()) {
+            info!(
+               "{addr} is now {} (product id {:?})",
+               device.device.name(),
+               device.device.product_id()
+            );
+         }
+      }
+
       if let Err(e) = self.establish_aap_connection(addr).await {
          debug!("AAP connection to {addr} not started: {e}");
       }
@@ -1395,6 +1429,19 @@ impl ManagerActor {
    }
 }
 
+/// Name and product id of a device, as `BlueZ` reports them now.
+///
+/// The address stands in for a missing name.
+async fn device_identity(device: &bluer::Device) -> (String, Option<u32>) {
+   let name = device
+      .name()
+      .await
+      .ok()
+      .flatten()
+      .unwrap_or_else(|| device.address().to_string());
+   (name, airpods::recognition::product_id(device).await)
+}
+
 /// Reports adapters that `BlueZ` adds, for as long as the manager runs.
 ///
 /// Each time the subscription starts, the manager also rescans, so an adapter added
@@ -1531,6 +1578,47 @@ mod managed_device_tests {
 
    impl crate::event::EventBus for NoEvents {
       fn emit(&self, _device: &AirPods, _event: AirPodsEvent) {}
+   }
+
+   #[test]
+   fn a_changed_name_or_product_id_replaces_the_device() {
+      let mut device = managed_device();
+      device.user_disconnected = true;
+      device.aap_retry_count = 2;
+
+      // Unchanged: the same device is kept
+      assert!(!device.refresh_identity("test".into(), None, None));
+
+      assert!(device.refresh_identity("Work Pods".into(), None, None));
+      assert_eq!(device.device.name(), "Work Pods");
+      assert_eq!(device.device.address(), Address::default());
+
+      // A product id that was unknown at first sight
+      assert!(device.refresh_identity("Work Pods".into(), Some(0x2024), None));
+      assert_eq!(device.device.product_id(), Some(0x2024));
+      assert_eq!(
+         device.device.to_json()["capabilities"]["adaptive_audio"],
+         true
+      );
+
+      // The manager's own state for the device is kept
+      assert!(device.user_disconnected);
+      assert_eq!(device.aap_retry_count, 2);
+      assert_eq!(device.adapter_name, "hci0");
+   }
+
+   #[test]
+   fn a_device_with_aap_open_is_not_replaced() {
+      let mut device = managed_device();
+      device.device.set_connected_for_test(true);
+      let open = device.device.clone();
+
+      assert!(!device.refresh_identity("Work Pods".into(), Some(0x2024), None));
+      assert_eq!(device.device.name(), "test");
+
+      // Still the device that holds the connection
+      open.set_connected_for_test(false);
+      assert!(!device.device.is_connected());
    }
 
    #[tokio::test]

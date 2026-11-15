@@ -179,6 +179,17 @@ impl AirPods {
       &self.0.name
    }
 
+   /// Marks the Airpod as connected or not, without a connection behind it.
+   #[cfg(test)]
+   pub(crate) fn set_connected_for_test(&self, connected: bool) {
+      self.0.is_connected.store(connected, Ordering::Relaxed);
+   }
+
+   /// Gets the Apple Bluetooth product ID of the Airpod, if known.
+   pub fn product_id(&self) -> Option<u32> {
+      self.0.product_id
+   }
+
    /// Gets the battery information of the Airpod.
    pub fn battery_info(&self) -> Option<BatteryInfo> {
       self.0.battery.load()
