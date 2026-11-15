@@ -181,6 +181,15 @@ Item {
                             // Closed-state box: same theme background as the popup,
                             // with the border highlighted on hover/focus/open.
                             background: Rectangle {
+                                // Plasma's ComboBox computes its paddings from these
+                                // background properties. Without them a padding becomes
+                                // NaN when it is re-evaluated (e.g. the card is shown
+                                // after being hidden), the text area collapses to zero
+                                // width and the selection shows as a lone ".".
+                                readonly property real topMargin: Kirigami.Units.mediumSpacing
+                                readonly property real leftMargin: Kirigami.Units.mediumSpacing
+                                readonly property real rightMargin: Kirigami.Units.mediumSpacing
+                                readonly property real bottomMargin: Kirigami.Units.mediumSpacing
                                 implicitHeight: Kirigami.Units.gridUnit * 1.6
                                 color: deviceCombo.pressed
                                     ? Kirigami.ColorUtils.adjustColor(Kirigami.Theme.backgroundColor, {"value": -8})
