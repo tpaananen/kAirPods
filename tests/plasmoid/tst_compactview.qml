@@ -23,16 +23,16 @@ TestCase {
         }
     }
 
-    function pod(level) {
-        return { level: level, charging: false }
+    function pod(level, charging) {
+        return { level: level, charging: !!charging }
     }
 
     function earbuds(left, right) {
         return { connected: true, battery: { left: left, right: right, case: null, headphone: null } }
     }
 
-    function headphones(level) {
-        return { connected: true, battery: { left: null, right: null, case: null, headphone: pod(level) } }
+    function headphones(level, charging) {
+        return { connected: true, battery: { left: null, right: null, case: null, headphone: pod(level, charging) } }
     }
 
     function findRing(item) {
@@ -113,5 +113,17 @@ TestCase {
     function test_headphones_keep_single_ring() {
         var probe = createView(headphones(50))
         expectKinds(probe, { "10": "green", "90": "green", "170": "green", "270": "track" })
+    }
+
+    // Earbuds in the case at 20%: green while charging, as in the popup,
+    // where an idle earbud at that level shows orange.
+    function test_charging_earbuds_turn_green() {
+        var probe = createView(earbuds(pod(20, true), pod(20)))
+        expectKinds(probe, { "-20": "green", "20": "orange" })
+    }
+
+    function test_charging_headphones_turn_green() {
+        var probe = createView(headphones(20, true))
+        expectKinds(probe, { "30": "green" })
     }
 }

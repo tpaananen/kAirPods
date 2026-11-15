@@ -29,20 +29,23 @@ function drift(battery) {
  * 0..1 of the half, and band > fill marks the drift highlight. While drifting
  * the higher earbud fills to the lower one's level and its band covers the
  * difference, so the band shows only on the side with more charge left.
+ * Each side also has `charging`; a charging side is green like the popup rings.
  */
 function splitRing(battery) {
     if (!battery || battery.headphone?.level != null) return null
     var left = sideLevel(battery.left), right = sideLevel(battery.right)
     var drifting = drift(battery) >= DRIFT_LEVEL
     var low = Math.min(left, right)
-    function side(level) {
+    function side(level, pod) {
+        var charging = !!pod?.charging
         return {
             fill: (drifting ? low : level) / 100,
             band: level / 100,
-            color: levelColor(level, false)
+            color: levelColor(level, charging),
+            charging: charging
         }
     }
-    return { left: side(left), right: side(right) }
+    return { left: side(left, battery.left), right: side(right, battery.right) }
 }
 
 function sideLevel(pod) {

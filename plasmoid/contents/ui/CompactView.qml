@@ -96,6 +96,7 @@ Item {
                 // Headphones get one clockwise arc from the top. Earbuds get a
                 // half per earbud (left half = left earbud), each full at the
                 // bottom centre and draining up towards a gap at the top.
+                // A charging arc (earbuds in the case) is green with a glow.
                 Canvas {
                     id: batteryRing
                     objectName: "batteryRing"
@@ -110,7 +111,8 @@ Item {
                     readonly property int bandLevel: lrDrifting ? Math.max(...batteryLevels) : arcLevel
                     property real progress: Math.max(0, Math.min(100, arcLevel)) / 100
                     property real bandEnd: Math.max(0, Math.min(100, bandLevel)) / 100
-                    property color progressColor: Battery.levelColor(arcLevel, false)
+                    readonly property bool headphoneCharging: !!(device?.connected && device.battery?.headphone?.charging)
+                    property color progressColor: Battery.levelColor(arcLevel, headphoneCharging)
                     property color trackColor: Kirigami.ColorUtils.adjustColor(Kirigami.Theme.textColor, {"alpha": -200})
 
                     // Earbuds: while drifting, the higher earbud's half fills to
@@ -122,6 +124,8 @@ Item {
                     property real rightBand: split ? split.right.band : 0
                     property color leftColor: split ? split.left.color : Battery.GREEN
                     property color rightColor: split ? split.right.color : Battery.GREEN
+                    property bool leftCharging: split ? split.left.charging : false
+                    property bool rightCharging: split ? split.right.charging : false
 
                     onProgressChanged: requestPaint()
                     onBandEndChanged: requestPaint()
@@ -135,6 +139,19 @@ Item {
                     onRightBandChanged: requestPaint()
                     onLeftColorChanged: requestPaint()
                     onRightColorChanged: requestPaint()
+                    onHeadphoneChargingChanged: requestPaint()
+                    onLeftChargingChanged: requestPaint()
+                    onRightChargingChanged: requestPaint()
+
+                    // Charging glow, as on the popup rings: the last stroked
+                    // arc again, wider and faint. Kept within the canvas edge.
+                    function glow(ctx) {
+                        ctx.save()
+                        ctx.globalAlpha = 0.3
+                        ctx.lineWidth = 5
+                        ctx.stroke()
+                        ctx.restore()
+                    }
 
                     onPaint: {
                         var ctx = getContext("2d")
@@ -159,6 +176,8 @@ Item {
                             ctx.arc(c, c, r, 0, 2 * Math.PI * progress)
                             ctx.strokeStyle = progressColor
                             ctx.stroke()
+                            if (headphoneCharging)
+                                glow(ctx)
                         }
 
                         if (bandEnd > progress) {
@@ -181,7 +200,7 @@ Item {
                         ctx.strokeStyle = trackColor
                         ctx.stroke()
 
-                        function half(sign, fill, band, color) {
+                        function half(sign, fill, band, color, charging) {
                             function stroke(from, to, style) {
                                 ctx.beginPath()
                                 ctx.arc(c, c, r, sign * (gap + span * from), sign * (gap + span * to), sign < 0)
@@ -190,13 +209,16 @@ Item {
                             }
                             // Charge runs from the top gap towards the bottom
                             // centre, so draining opens the ring from the bottom.
-                            if (fill > 0)
+                            if (fill > 0) {
                                 stroke(0, fill, color)
+                                if (charging)
+                                    glow(ctx)
+                            }
                             if (band > fill)
                                 stroke(fill, band, Battery.ORANGE)
                         }
-                        half(1, rightFill, rightBand, rightColor)
-                        half(-1, leftFill, leftBand, leftColor)
+                        half(1, rightFill, rightBand, rightColor, rightCharging)
+                        half(-1, leftFill, leftBand, leftColor, leftCharging)
                     }
 
                     Behavior on progress {

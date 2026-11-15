@@ -34,9 +34,25 @@ TestCase {
     }
 
     function test_split_ring_colors_each_side_by_its_own_level() {
-        var ring = Battery.splitRing(earbuds(pod(8, true), pod(25, true)))
+        var ring = Battery.splitRing(earbuds(pod(8), pod(25)))
         compare(ring.left.color, Battery.RED)
         compare(ring.right.color, Battery.ORANGE)
+    }
+
+    // In the case the earbuds charge: like the popup rings, a charging side
+    // turns green whatever its level, and only that side.
+    function test_split_ring_is_green_on_the_charging_side() {
+        var ring = Battery.splitRing(earbuds(pod(8, true), pod(25)))
+        compare(ring.left.color, Battery.GREEN)
+        compare(ring.left.charging, true)
+        compare(ring.right.color, Battery.ORANGE)
+        compare(ring.right.charging, false)
+    }
+
+    function test_split_ring_marks_missing_earbud_as_not_charging() {
+        var ring = Battery.splitRing(earbuds(pod(10, true), null))
+        compare(ring.left.charging, true)
+        compare(ring.right.charging, false)
     }
 
     function test_split_ring_highlights_drift_on_the_higher_earbud() {
