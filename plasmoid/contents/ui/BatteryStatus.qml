@@ -15,14 +15,9 @@ Card {
     readonly property bool leftLagging: lrDrifting && device.battery.left.level < device.battery.right.level
     readonly property bool rightLagging: lrDrifting && device.battery.right.level < device.battery.left.level
 
-    // Estimate shown only when available and no component is charging
-    readonly property bool showTtl: {
-        const hasEstimate = (device?.battery_ttl_estimate ?? 0) > 0
-        const headphoneCharging = device?.battery?.headphone?.charging ?? false
-        const leftCharging = device?.battery?.left?.charging ?? false
-        const rightCharging = device?.battery?.right?.charging ?? false
-        return hasEstimate && !(headphoneCharging || leftCharging || rightCharging)
-    }
+    // The service reports time left only for parts that drain: none while everything
+    // charges, and that of the bud in use while the other charges in the case
+    readonly property bool showTtl: (device?.battery_ttl_estimate ?? 0) > 0
 
     title: i18n("Battery")
     implicitHeight: Kirigami.Units.gridUnit * 8
@@ -86,6 +81,9 @@ Card {
                     showEarStatus: true
                     inEar: !!device?.ear_detection?.left_in_ear
                     highlightLevel: root.leftLagging
+                    // Only bud shown: time left sits on its percentage line
+                    sideText: root.showTtl && !rightRing.visible
+                              ? formatBatteryTime(device?.battery_ttl_estimate ?? 0) : ""
 
                     // Battery TTL estimate, centered in the gap between the L
                     // and R circles. Parented here to stay out of the layout;
@@ -122,6 +120,9 @@ Card {
                     showEarStatus: true
                     inEar: !!device?.ear_detection?.right_in_ear
                     highlightLevel: root.rightLagging
+                    // Only bud shown: time left sits on its percentage line
+                    sideText: root.showTtl && !leftRing.visible
+                              ? formatBatteryTime(device?.battery_ttl_estimate ?? 0) : ""
                 }
 
                 // Charging case

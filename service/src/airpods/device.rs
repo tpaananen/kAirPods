@@ -699,11 +699,8 @@ impl AirPods {
          .lock()
          .estimate_ttl(battery, mode, self.address())
          .or_else(|| {
-            // Nothing is draining while charging: the tracker has no estimate on purpose
-            let (left, right) = battery.split_ref();
-            if left.is_charging() || right.is_charging() {
-               return None;
-            }
+            // Only the parts in use drain; with none, there is no time left to report
+            let min_level = f64::from(battery.min_level_in_use()?);
 
             // Default drain rate until local/historical data is available
             let default_rate = if battery.headphone.is_available() {
@@ -711,7 +708,6 @@ impl AirPods {
             } else {
                EARBUDS_DEFAULT_DRAIN_RATE
             };
-            let min_level = f64::from(left.level.min(right.level));
             let minutes = (min_level / default_rate * 60.0) as u32;
             (minutes > 0).then_some(minutes)
          });
@@ -891,8 +887,18 @@ mod tests {
       report(70, 85);
       assert!(device.battery_ttl_estimate() < estimate);
 
-      // A charging bud has no time left to report, not even from the default rate
+      // A bud charging in the case: the time left is that of the bud in use, here from
+      // the default rate, as nothing has been recorded for it yet
       report_with_status(70, BatteryStatus::Charging, 85);
+      let one_bud = device.battery_ttl_estimate();
+      assert_eq!(one_bud, Some((85.0_f64 / 16.9 * 60.0) as u32));
+
+      // Both charging: nothing is draining, so there is no time left to report
+      let packet = battery_packet(&[
+         (Component::Left, 70, BatteryStatus::Charging),
+         (Component::Right, 85, BatteryStatus::Charging),
+      ]);
+      device.process_packet(device.address(), packet, &event_tx);
       assert_eq!(device.battery_ttl_estimate(), None);
       assert_eq!(device.to_json()["battery_ttl_estimate"], json!(null));
 

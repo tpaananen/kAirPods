@@ -572,32 +572,25 @@ impl BatteryTracker {
    ) -> Option<u32> {
       let prev_rate = self.last_drain_rate;
 
-      // Don't estimate if either bud is charging
+      // Estimate for the parts in use: a bud charging in the case, or one that is not
+      // reported, does not drain, but the other one can still be listened to
+      let Some(min_level) = battery_info.min_level_in_use() else {
+         if prev_rate.is_some() {
+            debug!("Battery TTL estimation unavailable: nothing is draining");
+            self.last_drain_rate = None;
+         }
+         return None;
+      };
       let (left, right) = battery_info.split_ref();
-      if left.is_charging() || right.is_charging() {
-         if prev_rate.is_some() {
-            debug!("Battery TTL estimation unavailable: AirPods are charging");
-            self.last_drain_rate = None;
-         }
-         return None;
-      }
 
-      // Don't estimate if either bud is disconnected
-      if !left.is_available() || !right.is_available() {
-         if prev_rate.is_some() {
-            debug!("Battery TTL estimation unavailable: One or both buds disconnected");
-            self.last_drain_rate = None;
-         }
-         return None;
-      }
-
-      // Get local drain rate and sample count
-      let (local_rate, local_sample_count) =
-         if let Some((rate, alpha, count)) = self.calculate_local_drain_rate() {
-            (Some((rate, alpha)), count)
-         } else {
-            (None, 0)
-         };
+      // Get local drain rate and sample count, from the buds in use
+      let (local_rate, local_sample_count) = if let Some((rate, alpha, count)) =
+         self.calculate_local_drain_rate_of(left.is_in_use(), right.is_in_use())
+      {
+         (Some((rate, alpha)), count)
+      } else {
+         (None, 0)
+      };
 
       // Try to get historical rate, falling back through modes if needed
       let mut historical_rate = None;
@@ -648,7 +641,7 @@ impl BatteryTracker {
       });
 
       // Use the minimum battery level for conservative estimate
-      let min_level = f64::from(left.level.min(right.level));
+      let min_level = f64::from(min_level);
       let new_minutes = (min_level / smoothed_rate * 60.0).round() as u32;
 
       if new_minutes > 0 && new_minutes < 24 * 60 {
@@ -671,6 +664,16 @@ impl BatteryTracker {
    /// Calculates drain rate from local battery history.
    /// Returns (`drain_rate`, alpha, `sample_count`)
    fn calculate_local_drain_rate(&self) -> Option<(f64, f64, usize)> {
+      self.calculate_local_drain_rate_of(true, true)
+   }
+
+   /// Calculates the drain rate from the history of the left bud, the right bud, or the
+   /// first of them that has enough samples.
+   fn calculate_local_drain_rate_of(
+      &self,
+      use_left: bool,
+      use_right: bool,
+   ) -> Option<(f64, f64, usize)> {
       const MIN_SAMPLES: usize = 4;
       const MAX_AGE_HOURS: f64 = 2.0;
 
@@ -679,20 +682,16 @@ impl BatteryTracker {
          .checked_sub(Duration::from_secs_f64(MAX_AGE_HOURS * 3600.0))
          .unwrap();
 
-      // Try to get drain rate from left or right history
-      if let Some((rate, alpha)) = self
-         .left_history
-         .calculate_drain_rate(MIN_SAMPLES, Some(max_age))
-      {
-         Some((rate, alpha, self.left_history.len()))
-      } else if let Some((rate, alpha)) = self
-         .right_history
-         .calculate_drain_rate(MIN_SAMPLES, Some(max_age))
-      {
-         Some((rate, alpha, self.right_history.len()))
-      } else {
-         None
-      }
+      [
+         (use_left, &self.left_history),
+         (use_right, &self.right_history),
+      ]
+      .into_iter()
+      .filter(|(used, _)| *used)
+      .find_map(|(_, history)| {
+         let (rate, alpha) = history.calculate_drain_rate(MIN_SAMPLES, Some(max_age))?;
+         Some((rate, alpha, history.len()))
+      })
    }
 
    /// Gets historical drain rate with caching to reduce DB queries.
@@ -1434,6 +1433,69 @@ mod tests {
          .estimate_ttl(&discharging_battery(80), None, TEST_ADDRESS)
          .unwrap();
       assert!(estimate.abs_diff(expected) <= 1, "{estimate} vs {expected}");
+   }
+
+   /// Records one 1% drop every 210 s (~17.1 %/hr) from 100% on the right bud only.
+   fn record_right_drops(tracker: &mut BatteryTracker, count: u64) {
+      let base_time = Instant::now();
+      for i in 0..count {
+         let timestamp = base_time + Duration::from_secs(i * 210);
+         tracker.right_history.push(timestamp, 100 - i as u8);
+      }
+   }
+
+   fn earbuds(left: BatteryState, right: BatteryState) -> BatteryInfo {
+      BatteryInfo {
+         left,
+         right,
+         case: BatteryState::new(),
+         headphone: BatteryState::new(),
+      }
+   }
+
+   #[test]
+   fn test_bud_in_ear_gets_an_estimate_while_the_other_charges() {
+      let mut tracker = BatteryTracker::new(None);
+      record_right_drops(&mut tracker, 12);
+
+      // Left in the case charging, right in the ear
+      let battery = earbuds(mock_state(100, true), mock_state(80, false));
+      let estimate = tracker
+         .estimate_ttl(&battery, None, TEST_ADDRESS)
+         .expect("the bud in use has a drain rate");
+
+      // From the level of the bud in use, not the charging one
+      let expected = (80.0 / RECORDED_RATE * 60.0).round() as u32;
+      assert!(estimate.abs_diff(expected) <= 1, "{estimate} vs {expected}");
+   }
+
+   #[test]
+   fn test_single_reported_bud_gets_an_estimate() {
+      let mut tracker = BatteryTracker::new(None);
+      record_right_drops(&mut tracker, 12);
+
+      // The left bud is not reported at all (closed case, out of range)
+      let battery = earbuds(BatteryState::new(), mock_state(80, false));
+      let estimate = tracker.estimate_ttl(&battery, None, TEST_ADDRESS);
+      let expected = (80.0 / RECORDED_RATE * 60.0).round() as u32;
+      assert!(
+         estimate.is_some_and(|estimate| estimate.abs_diff(expected) <= 1),
+         "{estimate:?} vs {expected}"
+      );
+   }
+
+   #[test]
+   fn test_no_estimate_when_no_bud_is_in_use() {
+      let mut tracker = BatteryTracker::new(None);
+      record_right_drops(&mut tracker, 12);
+
+      for battery in [
+         earbuds(mock_state(90, true), mock_state(80, true)),
+         earbuds(BatteryState::new(), mock_state(80, true)),
+         earbuds(BatteryState::new(), BatteryState::new()),
+      ] {
+         assert_eq!(tracker.estimate_ttl(&battery, None, TEST_ADDRESS), None);
+      }
    }
 
    #[test]

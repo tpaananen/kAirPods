@@ -402,6 +402,11 @@ impl BatteryState {
       self.status != BatteryStatus::Disconnected
    }
 
+   /// Reported and not charging: the battery is draining.
+   pub fn is_in_use(self) -> bool {
+      self.is_available() && !self.is_charging()
+   }
+
    pub fn to_json(self) -> serde_json::Value {
       if self.is_available() {
          json!({
@@ -449,6 +454,17 @@ impl BatteryInfo {
       } else {
          (&self.left, &self.right)
       }
+   }
+
+   /// Lowest level among the parts in use: the headphone of `AirPods` Max, or the
+   /// earbuds that are reported and not charging. `None` when nothing is draining.
+   pub fn min_level_in_use(&self) -> Option<u8> {
+      let (left, right) = self.split_ref();
+      [left, right]
+         .into_iter()
+         .filter(|state| state.is_in_use())
+         .map(|state| state.level)
+         .min()
    }
 
    pub fn to_json(self) -> serde_json::Value {
@@ -640,6 +656,31 @@ mod tests {
          status: BatteryStatus::Normal,
       };
       assert_eq!(info_right.aggregate_percentage(), Some(80));
+   }
+
+   #[test]
+   fn min_level_in_use_skips_charging_and_missing_parts() {
+      let state = |level, status| BatteryState { level, status };
+      let mut info = BatteryInfo::new();
+      assert_eq!(info.min_level_in_use(), None);
+
+      info.left = state(60, BatteryStatus::Normal);
+      info.right = state(80, BatteryStatus::Discharging);
+      assert_eq!(info.min_level_in_use(), Some(60));
+
+      // Left in the case charging: only the right bud drains
+      info.left = state(60, BatteryStatus::Charging);
+      assert_eq!(info.min_level_in_use(), Some(80));
+
+      // Right not reported either
+      info.right = BatteryState::new();
+      assert_eq!(info.min_level_in_use(), None);
+
+      // AirPods Max: the headphone battery
+      info.headphone = state(40, BatteryStatus::Normal);
+      assert_eq!(info.min_level_in_use(), Some(40));
+      info.headphone = state(40, BatteryStatus::Charging);
+      assert_eq!(info.min_level_in_use(), None);
    }
 
    #[test]
