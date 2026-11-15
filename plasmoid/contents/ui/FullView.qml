@@ -14,6 +14,15 @@ Item {
     property string selectedDevice: ""
     property var currentDevice: null
     property double currentTime: Date.now() / 1000
+    // The service keeps disconnected devices listed, so a non-empty list
+    // does not mean there is anything to show.
+    readonly property bool anyDeviceConnected: {
+        for (var addr in devices) {
+            if (devices[addr] && devices[addr].connected)
+                return true
+        }
+        return false
+    }
 
     function updateCurrentTime() {
         currentTime = Date.now() / 1000
@@ -96,13 +105,14 @@ Item {
             }
         }
 
-        // Device selector card - only show if multiple devices
+        // Device card: a name label for one device, a selector for several.
+        // Hidden while no device is connected.
         Card {
             Layout.fillWidth: true
             title: i18n("Device")
             showTitle: false
             implicitHeight: Object.keys(devices).length != 1 ? Kirigami.Units.gridUnit * 2.5 : Kirigami.Units.gridUnit * 2
-            visible: Object.keys(devices).length > 0
+            visible: root.anyDeviceConnected
 
             contentItem: Component {
                 Loader {
