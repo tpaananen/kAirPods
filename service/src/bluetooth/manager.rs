@@ -1170,21 +1170,27 @@ impl ManagerActor {
    ///
    /// bluer reports the removal of any interface of a device as the device being removed,
    /// and ends its event stream. `BlueZ` removes `Battery1` on every disconnect, so the
-   /// device is forgotten only if `BlueZ` no longer lists it; otherwise it is watched again.
+   /// device is forgotten only if `BlueZ` no longer has it; otherwise it is watched again.
    async fn handle_device_lost(&mut self, addr: Address, adapter_name: SmolStr) {
       // The monitor's event stream has ended either way
-      self.device_monitors.remove(&addr);
+      let was_monitored = self.device_monitors.remove(&addr).is_some();
       self.other_vendor.remove(&addr);
+      if !was_monitored && !self.devices.contains_key(&addr) {
+         return;
+      }
 
-      let still_listed = match self.adapters.get(&adapter_name) {
-         Some(info) => info
-            .adapter
-            .device_addresses()
-            .await
-            .is_ok_and(|addresses| addresses.contains(&addr)),
+      // Ask about this device alone: a read fails once its Device1 object is gone. Many
+      // devices go at once when a discovery ends, so listing every object per removal
+      // would cost more with each one.
+      let still_present = match self
+         .adapters
+         .get(&adapter_name)
+         .and_then(|info| info.adapter.device(addr).ok())
+      {
+         Some(device) => device.is_connected().await.is_ok(),
          None => false,
       };
-      if still_listed {
+      if still_present {
          debug!("{addr} lost a BlueZ interface but is still present, watching it again");
          self.monitor_device(addr, &adapter_name);
          return;
