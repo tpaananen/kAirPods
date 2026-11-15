@@ -6,12 +6,11 @@
 
 use std::{sync::Arc, time::Duration};
 
-use crossbeam::queue::SegQueue;
 use log::{debug, info, warn};
 use tokio::{
    select,
    signal::{self, unix::SignalKind},
-   sync::Notify,
+   sync::mpsc,
    time,
 };
 use zbus::{Connection, connection, object_server::InterfaceRef};
@@ -85,7 +84,7 @@ async fn main() -> Result<()> {
    }
 
    // Create event channel
-   let event_bus = EventProcessor::new();
+   let (event_bus, events) = EventProcessor::new();
 
    // Initialize battery study database
    let battery_study = match battery_study::BatteryStudy::open() {
@@ -128,9 +127,7 @@ async fn main() -> Result<()> {
    };
 
    // Start event processor
-   event_bus
-      .spawn_dispatcher(connection, bluez_battery)
-      .await?;
+   spawn_dispatcher(events, connection, bluez_battery).await?;
 
    // Wait for shutdown signal
    shutdown_signal().await?;
@@ -157,172 +154,154 @@ async fn shutdown_signal() -> Result<()> {
    Ok(())
 }
 
+/// A device and one of its events, on their way to the dispatcher.
+type DeviceEvent = (AirPods, AirPodsEvent);
+
+/// Event bus of the service: queues events for the dispatcher.
 struct EventProcessor {
-   queue: SegQueue<(AirPods, AirPodsEvent)>,
-   notifier: Notify,
+   tx: mpsc::UnboundedSender<DeviceEvent>,
 }
 
 impl EventProcessor {
-   fn new() -> Arc<Self> {
-      Arc::new(Self {
-         queue: SegQueue::new(),
-         notifier: Notify::new(),
-      })
-   }
-}
-
-impl EventProcessor {
-   async fn recv(self: &Arc<Self>) -> Option<(AirPods, AirPodsEvent)> {
-      loop {
-         if let Some(event) = self.queue.pop() {
-            return Some(event);
-         }
-         let notify = self.notifier.notified();
-         if let Some(event) = self.queue.pop() {
-            return Some(event);
-         }
-         if Arc::strong_count(self) == 1 {
-            return None;
-         }
-         let _ = time::timeout(Duration::from_secs(1), notify).await;
-      }
-   }
-
-   async fn dispatch(
-      &self,
-      iface: &InterfaceRef<AirPodsService>,
-      (device, event): (AirPods, AirPodsEvent),
-      bluez_battery: Option<&BluezBatteryManager>,
-      media: &MediaControl,
-   ) -> Result<()> {
-      let addr_str = device.address_str();
-      match event {
-         AirPodsEvent::DeviceConnected => {
-            iface.device_connected(addr_str).await?;
-            if let Some(mgr) = bluez_battery
-               && let Some(level) = device.battery_info().and_then(|b| b.aggregate_percentage())
-            {
-               mgr.update_device_battery(addr_str, level).await;
-            }
-            // Emit property changes
-            iface
-               .get()
-               .await
-               .devices_changed(iface.signal_emitter())
-               .await?;
-            iface
-               .get()
-               .await
-               .connected_count_changed(iface.signal_emitter())
-               .await?;
-         },
-         AirPodsEvent::DeviceDisconnected => {
-            if let Some(mgr) = bluez_battery {
-               mgr.remove_device(addr_str).await;
-            }
-            iface.device_disconnected(addr_str).await?;
-            // Emit property changes
-            iface
-               .get()
-               .await
-               .devices_changed(iface.signal_emitter())
-               .await?;
-            iface
-               .get()
-               .await
-               .connected_count_changed(iface.signal_emitter())
-               .await?;
-         },
-         AirPodsEvent::BatteryUpdated(battery) => {
-            if let Some(mgr) = bluez_battery
-               && let Some(level) = battery.aggregate_percentage()
-            {
-               mgr.update_device_battery(addr_str, level).await;
-            }
-            iface
-               .battery_updated(addr_str, &battery.to_json().to_string())
-               .await?;
-            // Emit property change for devices (battery state changed)
-            iface
-               .get()
-               .await
-               .devices_changed(iface.signal_emitter())
-               .await?;
-         },
-         AirPodsEvent::NoiseControlChanged(mode) => {
-            iface.noise_control_changed(addr_str, mode.to_str()).await?;
-            // Emit property change for devices (noise control state changed)
-            iface
-               .get()
-               .await
-               .devices_changed(iface.signal_emitter())
-               .await?;
-         },
-         AirPodsEvent::EarDetectionChanged {
-            status: ear_detection,
-            previous,
-         } => {
-            iface
-               .ear_detection_changed(addr_str, &ear_detection.to_json().to_string())
-               .await?;
-            // Emit property change for devices (ear detection state changed)
-            iface
-               .get()
-               .await
-               .devices_changed(iface.signal_emitter())
-               .await?;
-
-            // Pause when a bud leaves an ear, resume when one goes back in
-            if previous.is_none() {
-               debug!("Initial ear detection state for {addr_str}, leaving playback alone");
-            } else if let Some(action) = media_control::playback_action(previous, ear_detection) {
-               media.apply(action);
-            }
-         },
-         AirPodsEvent::DeviceError => {
-            iface.device_error(addr_str).await?;
-            // Emit property change for devices (error state might affect device info)
-            iface
-               .get()
-               .await
-               .devices_changed(iface.signal_emitter())
-               .await?;
-         },
-      }
-      Ok(())
-   }
-
-   async fn spawn_dispatcher(
-      self: Arc<Self>,
-      connection: Connection,
-      bluez_battery: Option<Arc<BluezBatteryManager>>,
-   ) -> Result<()> {
-      let iface = connection
-         .object_server()
-         .interface::<_, AirPodsService>("/org/kairpods/manager")
-         .await?;
-      // Media players are driven from their own task, so they cannot delay the signals
-      let media = MediaControl::spawn(connection);
-      tokio::spawn(async move {
-         while let Some(event) = self.recv().await {
-            if let Err(e) = self
-               .dispatch(&iface, event, bluez_battery.as_deref(), &media)
-               .await
-            {
-               warn!("Error dispatching event: {e}");
-            }
-         }
-      });
-
-      Ok(())
+   /// Creates the bus and the receiver its events go to.
+   ///
+   /// The receiver ends as soon as every handle to the bus is dropped.
+   fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<DeviceEvent>) {
+      let (tx, rx) = mpsc::unbounded_channel();
+      (Arc::new(Self { tx }), rx)
    }
 }
 
 impl EventBus for EventProcessor {
    fn emit(&self, device: &AirPods, event: AirPodsEvent) {
-      self.queue.push((device.clone(), event));
-      self.notifier.notify_waiters();
+      // Fails only once the dispatcher is gone, at shutdown
+      let _ = self.tx.send((device.clone(), event));
    }
+}
+
+async fn dispatch(
+   iface: &InterfaceRef<AirPodsService>,
+   (device, event): DeviceEvent,
+   bluez_battery: Option<&BluezBatteryManager>,
+   media: &MediaControl,
+) -> Result<()> {
+   let addr_str = device.address_str();
+   match event {
+      AirPodsEvent::DeviceConnected => {
+         iface.device_connected(addr_str).await?;
+         if let Some(mgr) = bluez_battery
+            && let Some(level) = device.battery_info().and_then(|b| b.aggregate_percentage())
+         {
+            mgr.update_device_battery(addr_str, level).await;
+         }
+         // Emit property changes
+         iface
+            .get()
+            .await
+            .devices_changed(iface.signal_emitter())
+            .await?;
+         iface
+            .get()
+            .await
+            .connected_count_changed(iface.signal_emitter())
+            .await?;
+      },
+      AirPodsEvent::DeviceDisconnected => {
+         if let Some(mgr) = bluez_battery {
+            mgr.remove_device(addr_str).await;
+         }
+         iface.device_disconnected(addr_str).await?;
+         // Emit property changes
+         iface
+            .get()
+            .await
+            .devices_changed(iface.signal_emitter())
+            .await?;
+         iface
+            .get()
+            .await
+            .connected_count_changed(iface.signal_emitter())
+            .await?;
+      },
+      AirPodsEvent::BatteryUpdated(battery) => {
+         if let Some(mgr) = bluez_battery
+            && let Some(level) = battery.aggregate_percentage()
+         {
+            mgr.update_device_battery(addr_str, level).await;
+         }
+         iface
+            .battery_updated(addr_str, &battery.to_json().to_string())
+            .await?;
+         // Emit property change for devices (battery state changed)
+         iface
+            .get()
+            .await
+            .devices_changed(iface.signal_emitter())
+            .await?;
+      },
+      AirPodsEvent::NoiseControlChanged(mode) => {
+         iface.noise_control_changed(addr_str, mode.to_str()).await?;
+         // Emit property change for devices (noise control state changed)
+         iface
+            .get()
+            .await
+            .devices_changed(iface.signal_emitter())
+            .await?;
+      },
+      AirPodsEvent::EarDetectionChanged {
+         status: ear_detection,
+         previous,
+      } => {
+         iface
+            .ear_detection_changed(addr_str, &ear_detection.to_json().to_string())
+            .await?;
+         // Emit property change for devices (ear detection state changed)
+         iface
+            .get()
+            .await
+            .devices_changed(iface.signal_emitter())
+            .await?;
+
+         // Pause when a bud leaves an ear, resume when one goes back in
+         if previous.is_none() {
+            debug!("Initial ear detection state for {addr_str}, leaving playback alone");
+         } else if let Some(action) = media_control::playback_action(previous, ear_detection) {
+            media.apply(action);
+         }
+      },
+      AirPodsEvent::DeviceError => {
+         iface.device_error(addr_str).await?;
+         // Emit property change for devices (error state might affect device info)
+         iface
+            .get()
+            .await
+            .devices_changed(iface.signal_emitter())
+            .await?;
+      },
+   }
+   Ok(())
+}
+
+async fn spawn_dispatcher(
+   mut events: mpsc::UnboundedReceiver<DeviceEvent>,
+   connection: Connection,
+   bluez_battery: Option<Arc<BluezBatteryManager>>,
+) -> Result<()> {
+   let iface = connection
+      .object_server()
+      .interface::<_, AirPodsService>("/org/kairpods/manager")
+      .await?;
+   // Media players are driven from their own task, so they cannot delay the signals
+   let media = MediaControl::spawn(connection);
+   tokio::spawn(async move {
+      while let Some(event) = events.recv().await {
+         if let Err(e) = dispatch(&iface, event, bluez_battery.as_deref(), &media).await {
+            warn!("Error dispatching event: {e}");
+         }
+      }
+   });
+
+   Ok(())
 }
 
 #[cfg(test)]
@@ -333,6 +312,27 @@ mod tests {
    };
 
    use super::*;
+
+   #[tokio::test]
+   async fn dispatcher_stops_as_soon_as_the_event_bus_is_dropped() {
+      let (processor, mut events) = EventProcessor::new();
+      let device = AirPods::new(Default::default(), "test".into(), None, None);
+
+      // An event reaches the dispatcher as it is emitted
+      processor.emit(&device, AirPodsEvent::DeviceConnected);
+      let received = time::timeout(Duration::from_millis(200), events.recv()).await;
+      assert!(matches!(
+         received,
+         Ok(Some((_, AirPodsEvent::DeviceConnected)))
+      ));
+
+      let waiting = tokio::spawn(async move { events.recv().await.is_none() });
+      tokio::task::yield_now().await;
+
+      drop(processor);
+      let stopped = time::timeout(Duration::from_millis(200), waiting).await;
+      assert!(matches!(stopped, Ok(Ok(true))), "dispatcher still waiting");
+   }
 
    #[tokio::test]
    async fn sigterm_ends_shutdown_wait() {

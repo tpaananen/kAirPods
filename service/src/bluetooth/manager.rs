@@ -7,8 +7,9 @@ use std::{collections::HashMap, time::Duration};
 
 use bluer::{
    Adapter, AdapterEvent, AdapterProperty, Address, DeviceEvent, DeviceProperty, Session,
+   SessionEvent,
 };
-use futures::stream::StreamExt;
+use futures::stream::{Stream, StreamExt};
 use log::{debug, error, info, warn};
 use smol_str::SmolStr;
 use tokio::{
@@ -29,8 +30,8 @@ use rand::Rng;
 
 /// Interval of the scan that catches connection changes the device events missed
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
-/// Interval to check for new adapters
-const ADAPTER_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// Delay before subscribing to new adapters again after the subscription failed or ended
+const ADAPTER_WATCH_RETRY_DELAY: Duration = Duration::from_secs(10);
 /// Delay before the first adapter recovery attempt; doubles per failure
 const ADAPTER_RECOVERY_DELAY: Duration = Duration::from_secs(5);
 /// Maximum delay between adapter recovery attempts
@@ -164,30 +165,67 @@ impl ManagedDevice {
 
 // === Commands ===
 
+/// Messages handled by the manager actor, one at a time.
+///
+/// Event commands come from the manager's own tasks (monitors, connection tasks, timers)
+/// over the loopback channel; user commands come from [`BluetoothManager`] and carry a
+/// channel for the answer.
 #[derive(Debug)]
 enum ManagerCommand {
    // Adapter events
+   /// The adapter (by name) is powered: already when its monitor starts, or turned on
+   /// later. Sets up an adapter that is not active.
    AdapterPowered(SmolStr),
+   /// The adapter (by name) was turned off. An active adapter is marked powered off.
    AdapterPoweredOff(SmolStr),
+   /// The event stream of the adapter (by name) ended, typically because `BlueZ` removed
+   /// it. Closes AAP on its devices and schedules a recovery.
    AdapterLost(SmolStr),
-   AdapterError(SmolStr, String), // adapter_name, error
+   /// Watching the adapter failed: adapter name, error. Schedules a recovery.
+   AdapterError(SmolStr, String),
+   /// `BlueZ` added the adapter (by name). Sets it up unless it is already active.
+   AdapterAdded(SmolStr),
+   /// Look for adapters that appeared while nothing was watching
+   RescanAdapters,
 
    // Device events
-   DeviceAdded(Address, SmolStr),        // address, adapter_name
-   DeviceDiscovered(Address, SmolStr),   // address, adapter_name
-   BluetoothConnected(Address, SmolStr), // address, adapter_name
+   /// `BlueZ` added a device to an adapter: address, adapter name. Starts watching it.
+   DeviceAdded(Address, SmolStr),
+   /// The periodic scan found connected `AirPods` without AAP: address, adapter name.
+   /// Adopts an unknown device, or reconnects AAP to a known one.
+   DeviceDiscovered(Address, SmolStr),
+   /// The Bluetooth link of a device is up: address, adapter name. Adopts an unknown
+   /// device if it is `AirPods`, and connects AAP.
+   BluetoothConnected(Address, SmolStr),
+   /// The Bluetooth link of the device at this address is down. Closes AAP.
    BluetoothDisconnected(Address),
-   AAPConnected(Address, u64),          // address, attempt
-   AAPDisconnected(Address, u64, bool), // address, attempt, is_error
-   RetryAAP(Address, u64),              // address, attempt
-   DeviceLost(Address, SmolStr),        // address, adapter_name
+   /// A connection task established AAP: address, attempt. Ignored for a superseded
+   /// attempt.
+   AAPConnected(Address, u64),
+   /// A connection task ended: address, attempt, whether it ended with an error. An
+   /// error schedules a retry while the link is up. Ignored for a superseded attempt.
+   AAPDisconnected(Address, u64, bool),
+   /// A scheduled retry is due: address, attempt it belongs to. Ignored if a newer
+   /// attempt replaced it.
+   RetryAAP(Address, u64),
+   /// `BlueZ` reported a device as removed: address, adapter name. The device is
+   /// forgotten only if `BlueZ` no longer lists it.
+   DeviceLost(Address, SmolStr),
 
    // User commands
+   /// Connect AAP to the device at this address and answer with the result. Lifts an
+   /// earlier user disconnect.
    EstablishAAP(Address, oneshot::Sender<Result<()>>),
+   /// Close AAP to the device at this address and keep it down until the user or a new
+   /// Bluetooth connection brings it back. Answers with the result if a channel is given.
    DisconnectAAP(Address, Option<oneshot::Sender<Result<()>>>),
+   /// Answer with the device at this address, if managed.
    GetDeviceState(Address, oneshot::Sender<Option<AirPods>>),
+   /// Answer with every managed device.
    GetAllDeviceStates(oneshot::Sender<Vec<AirPods>>),
+   /// Answer with the number of devices with an AAP connection.
    CountConnectedDevices(oneshot::Sender<u32>),
+   /// Stop the manager: close all connections, then answer once cleanup has finished.
    Shutdown(oneshot::Sender<()>),
 }
 
@@ -349,8 +387,11 @@ impl ManagerActor {
       );
       health_check_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-      let mut adapter_check_interval = time::interval(ADAPTER_CHECK_INTERVAL);
-      adapter_check_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+      // New adapters are reported by BlueZ instead of polled for
+      tokio::spawn(watch_adapters(
+         self.session.clone(),
+         self.loopback_tx.clone(),
+      ));
 
       let mut device_tick_interval = time::interval(DEVICE_TICK_INTERVAL);
       device_tick_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -382,10 +423,6 @@ impl ManagerActor {
                  // Check connection health and scan for new devices
                  self.check_connection_health().await;
                  self.scan_for_connected_airpods().await;
-             }
-             _ = adapter_check_interval.tick() => {
-                 // Check for new adapters
-                 self.discover_new_adapters().await;
              }
              _ = device_tick_interval.tick() => {
                  // Tick all devices
@@ -690,6 +727,12 @@ impl ManagerActor {
          ManagerCommand::AdapterError(name, error) => {
             self.handle_adapter_error(&name, error);
          },
+         ManagerCommand::AdapterAdded(name) => {
+            self.handle_adapter_added(name).await;
+         },
+         ManagerCommand::RescanAdapters => {
+            self.discover_new_adapters().await;
+         },
          ManagerCommand::DeviceAdded(addr, adapter_name) => {
             self.monitor_device(addr, &adapter_name);
          },
@@ -849,6 +892,20 @@ impl ManagerActor {
                .event_tx
                .emit(&device.device, AirPodsEvent::DeviceError);
          }
+      }
+   }
+
+   /// Handles an adapter that `BlueZ` added.
+   ///
+   /// A known adapter that comes back, as after a bluetoothd restart, is set up at once
+   /// instead of after its recovery backoff.
+   async fn handle_adapter_added(&mut self, name: SmolStr) {
+      if self
+         .adapters
+         .get(&name)
+         .is_none_or(|info| info.state != AdapterState::Active)
+      {
+         self.initialize_adapter(name).await;
       }
    }
 
@@ -1338,6 +1395,54 @@ impl ManagerActor {
    }
 }
 
+/// Reports adapters that `BlueZ` adds, for as long as the manager runs.
+///
+/// Each time the subscription starts, the manager also rescans, so an adapter added
+/// before the subscription took effect, or while it was down, is found too.
+async fn watch_adapters(session: Session, loopback: mpsc::Sender<ManagerCommand>) {
+   loop {
+      match session.events().await {
+         Ok(events) => {
+            if loopback.send(ManagerCommand::RescanAdapters).await.is_err()
+               || !forward_adapter_events(events, &loopback).await
+            {
+               return;
+            }
+            warn!("BlueZ adapter events ended, subscribing again");
+         },
+         Err(e) => warn!("Failed to watch for new adapters: {e}"),
+      }
+      time::sleep(ADAPTER_WATCH_RETRY_DELAY).await;
+      if loopback.is_closed() {
+         return;
+      }
+   }
+}
+
+/// Forwards adapter additions to the manager until the stream ends.
+///
+/// Removals are left to the adapter's own monitor, which reports them. Returns `false`
+/// once the manager is gone.
+async fn forward_adapter_events(
+   events: impl Stream<Item = SessionEvent>,
+   loopback: &mpsc::Sender<ManagerCommand>,
+) -> bool {
+   futures::pin_mut!(events);
+   while let Some(event) = events.next().await {
+      if let SessionEvent::AdapterAdded(name) = event {
+         debug!("BlueZ added adapter {name}");
+         if loopback
+            .send(ManagerCommand::AdapterAdded(name.into()))
+            .await
+            .is_err()
+         {
+            return false;
+         }
+      }
+   }
+   true
+}
+
 fn adapter_retry_delay(retry_count: u32) -> Duration {
    ADAPTER_RECOVERY_DELAY
       .saturating_mul(1_u32 << retry_count.min(5))
@@ -1452,6 +1557,36 @@ mod managed_device_tests {
 #[cfg(test)]
 mod adapter_retry_tests {
    use super::*;
+
+   #[tokio::test]
+   async fn added_adapters_are_forwarded_and_removals_left_to_their_monitor() {
+      let (tx, mut rx) = mpsc::channel(8);
+      let events = futures::stream::iter([
+         SessionEvent::AdapterAdded("hci1".into()),
+         SessionEvent::AdapterRemoved("hci0".into()),
+         SessionEvent::AdapterAdded("hci2".into()),
+      ]);
+
+      // The stream ended while the manager is still there
+      assert!(forward_adapter_events(events, &tx).await);
+      drop(tx);
+      let mut added = Vec::new();
+      while let Some(command) = rx.recv().await {
+         match command {
+            ManagerCommand::AdapterAdded(name) => added.push(name),
+            other => panic!("unexpected command {other:?}"),
+         }
+      }
+      assert_eq!(added, ["hci1", "hci2"]);
+   }
+
+   #[tokio::test]
+   async fn forwarding_stops_once_the_manager_is_gone() {
+      let (tx, rx) = mpsc::channel(8);
+      drop(rx);
+      let events = futures::stream::iter([SessionEvent::AdapterAdded("hci1".into())]);
+      assert!(!forward_adapter_events(events, &tx).await);
+   }
 
    #[test]
    fn recovery_backoff_grows_and_stays_capped() {
