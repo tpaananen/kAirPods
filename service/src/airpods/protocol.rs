@@ -170,18 +170,8 @@ impl<T> NoiseControlMap<T> {
       self.data[i].get_or_insert_with(f)
    }
 
-   pub const fn remove(&mut self, mode: NoiseControlMode) -> Option<T> {
-      let i = mode.index();
-      self.data[i].take()
-   }
-
    pub fn len(&self) -> usize {
       self.data.iter().filter(|v| v.is_some()).count()
-   }
-
-   #[cfg(test)]
-   pub fn is_empty(&self) -> bool {
-      self.data.iter().all(|v| v.is_none())
    }
 }
 

@@ -225,6 +225,9 @@ struct Db {
    env: Env,
    /// MAC address -> `DeviceStudy`
    devices: Database<KeyCodec, SerdeBincode<DeviceStudy>>,
+   /// Drain rate reads so far, for tests that count them
+   #[cfg(test)]
+   rate_reads: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +247,29 @@ pub struct DrainRateStats {
    pub samples: u32,      // Total samples
    pub last_updated: u64, // Unix timestamp
 }
+
+impl DrainRateStats {
+   /// The rate with its 95% confidence interval, unless it cannot be used.
+   fn usable(&self) -> Option<(f64, f64)> {
+      // Stored by earlier versions from history that spanned a suspend
+      if self.rate > MAX_PLAUSIBLE_DRAIN_RATE {
+         return None;
+      }
+
+      // A variance of exactly zero means the rate comes from a single save: there is no
+      // spread to measure, so nothing is known about how reliable it is.
+      let samples = self.samples.min(MAX_STUDY_SAMPLES);
+      let confidence = if samples > 1 && self.variance > 0.0 {
+         1.96 * (self.variance / f64::from(samples)).sqrt()
+      } else {
+         f64::INFINITY
+      };
+      Some((self.rate, confidence))
+   }
+}
+
+/// Drain rate and its confidence interval, per noise mode
+pub type DrainRates = NoiseControlMap<(f64, f64)>;
 
 /// Thread-safe wrapper for battery study database
 #[derive(Clone, Debug)]
@@ -278,7 +304,12 @@ impl BatteryStudy {
       wtxn.commit().map_err(Error::Transaction)?;
 
       Ok(Self {
-         db: Arc::new(Db { env, devices }),
+         db: Arc::new(Db {
+            env,
+            devices,
+            #[cfg(test)]
+            rate_reads: Default::default(),
+         }),
       })
    }
 
@@ -391,42 +422,36 @@ impl BatteryStudy {
    }
 
    /// Get drain rate with confidence interval
+   #[cfg(test)]
    pub fn get_drain_rate(
       &self,
       address: Address,
       mode: NoiseControlMode,
    ) -> Result<Option<(f64, f64)>> {
+      Ok(self.get_drain_rates(address)?.get(mode).copied())
+   }
+
+   /// Drain rate with confidence interval for every noise mode that has one, from a
+   /// single read.
+   pub fn get_drain_rates(&self, address: Address) -> Result<DrainRates> {
+      #[cfg(test)]
+      self.count_rate_read();
       let rtxn = self.db.env.read_txn().map_err(Error::Transaction)?;
 
-      let Some(study) = self
+      let mut rates = NoiseControlMap::default();
+      if let Some(study) = self
          .db
          .devices
          .get(&rtxn, &address)
          .map_err(Error::DatabaseOperation)?
-      else {
-         return Ok(None);
-      };
-
-      if let Some(stats) = study.drain_rates.get(mode) {
-         // Stored by earlier versions from history that spanned a suspend
-         if stats.rate > MAX_PLAUSIBLE_DRAIN_RATE {
-            return Ok(None);
+      {
+         for mode in NoiseControlMode::iter() {
+            if let Some(rate) = study.drain_rates.get(mode).and_then(DrainRateStats::usable) {
+               rates.insert(mode, rate);
+            }
          }
-
-         // Calculate 95% confidence interval. A variance of exactly zero means the rate
-         // comes from a single save: there is no spread to measure, so nothing is known
-         // about how reliable it is.
-         let samples = stats.samples.min(MAX_STUDY_SAMPLES);
-         let confidence = if samples > 1 && stats.variance > 0.0 {
-            1.96 * (stats.variance / f64::from(samples)).sqrt()
-         } else {
-            f64::INFINITY
-         };
-
-         Ok(Some((stats.rate, confidence)))
-      } else {
-         Ok(None)
       }
+      Ok(rates)
    }
 
    /// Records the start of a session for a device. Writes to the database, so it may
@@ -518,7 +543,6 @@ impl PendingSave {
 /// What [`BatteryTracker::begin_save`] is saving, for [`BatteryTracker::finish_save`].
 #[derive(Debug, Clone, Copy)]
 pub struct SaveMark {
-   noise_mode: NoiseControlMode,
    /// Samples written, from the unsaved count of the bud with the most
    samples: usize,
    session: u64,
@@ -537,8 +561,9 @@ pub struct BatteryTracker {
    /// Counts the sessions ended by [`Self::take_session`], so a save that finishes after
    /// its session ended does not touch the next one
    session: u64,
-   // Cache for historical drain rates to reduce DB queries
-   historical_cache: Mutex<NoiseControlMap<(f64, f64, Instant)>>, // (rate, confidence, last_updated)
+   /// Stored drain rates (rate, confidence) of every noise mode, and when they were read;
+   /// `None` until read, and after a save changed them
+   historical_cache: Mutex<Option<(DrainRates, Instant)>>,
 }
 
 impl BatteryTracker {
@@ -605,10 +630,11 @@ impl BatteryTracker {
       };
 
       // Try to get historical rate, falling back through modes if needed
+      let historical_rates = self.historical_rates(address);
       let mut historical_rate = None;
       let mut used_mode = None;
       for mode in noise_mode.iter().copied().chain(NoiseControlMode::iter()) {
-         if let Some(rate) = self.get_historical_rate_cached(address, mode) {
+         if let Some(&rate) = historical_rates.get(mode) {
             historical_rate = Some(rate);
             used_mode = Some(mode);
             break;
@@ -706,50 +732,34 @@ impl BatteryTracker {
       })
    }
 
-   /// Gets historical drain rate with caching to reduce DB queries.
-   fn get_historical_rate_cached(
-      &self,
-      address: Address,
-      mode: NoiseControlMode,
-   ) -> Option<(f64, f64)> {
+   /// Stored drain rates of every noise mode, read at most once per cache period.
+   ///
+   /// Modes without a stored rate are cached too: battery reports would otherwise read
+   /// the database for each of them on every report.
+   fn historical_rates(&self, address: Address) -> DrainRates {
       const CACHE_DURATION: Duration = Duration::from_secs(300); // 5 minutes
 
-      // Check cache first
+      let mut cache = self.historical_cache.lock();
+      if let Some((rates, read_at)) = *cache
+         && read_at.elapsed() < CACHE_DURATION
       {
-         let cache = self.historical_cache.lock();
-         if let Some(&(rate, confidence, last_updated)) = cache.get(mode)
-            && last_updated.elapsed() < CACHE_DURATION
-         {
-            return Some((rate, confidence));
-         }
+         return rates;
       }
 
-      // Cache miss or expired, query from study
-      if let Some(ref study) = self.study {
-         match study.get_drain_rate(address, mode) {
-            Ok(Some((rate, confidence))) => {
-               debug!(
-                  "Found historical drain rate for {address} mode {mode}: {rate:.1}%/hr (confidence: ±{confidence:.1})"
-               );
-               // Update cache
-               self
-                  .historical_cache
-                  .lock()
-                  .insert(mode, (rate, confidence, Instant::now()));
-               return Some((rate, confidence));
-            },
-            Ok(None) => {
-               debug!("No historical drain rate found for {address} mode {mode}");
-            },
-            Err(e) => {
-               debug!("Error getting historical drain rate: {e}");
-            },
-         }
-      } else {
-         debug!("No battery study available");
+      let Some(study) = &self.study else {
+         return NoiseControlMap::default();
+      };
+      match study.get_drain_rates(address) {
+         Ok(rates) => {
+            debug!("Read historical drain rates for {address}: {rates:?}");
+            *cache = Some((rates, Instant::now()));
+            rates
+         },
+         Err(e) => {
+            debug!("Error getting historical drain rates: {e}");
+            NoiseControlMap::default()
+         },
       }
-
-      None
    }
 
    /// Combines local and historical drain rates using weighted average based on confidence.
@@ -903,7 +913,6 @@ impl BatteryTracker {
       let pending = self.pending_save(address, noise_mode)?;
       self.last_save = Some(Instant::now());
       let mark = SaveMark {
-         noise_mode,
          samples: pending.new_samples as usize,
          session: self.session,
       };
@@ -915,8 +924,8 @@ impl BatteryTracker {
    /// Only the samples that were written count as saved: those recorded during the write
    /// are saved next time. A save that outlived its session leaves the new one alone.
    pub fn finish_save(&mut self, mark: SaveMark) {
-      // The next estimate reads the stored rate again
-      self.historical_cache.lock().remove(mark.noise_mode);
+      // The next estimate reads the stored rates again
+      self.historical_cache.lock().take();
       if mark.session != self.session {
          return;
       }
@@ -957,8 +966,8 @@ impl BatteryTracker {
    ) -> Option<PendingSave> {
       let pending = self.pending_save(address, noise_mode);
       if pending.is_some() {
-         // The next estimate reads the stored rate again
-         self.historical_cache.lock().remove(noise_mode);
+         // The next estimate reads the stored rates again
+         self.historical_cache.lock().take();
       }
       self.left_history.clear();
       self.right_history.clear();
@@ -976,6 +985,21 @@ impl BatteryStudy {
       let dir = tempfile::TempDir::new().unwrap();
       let study = Self::open_at(dir.path()).unwrap();
       (study, dir)
+   }
+
+   fn count_rate_read(&self) {
+      self
+         .db
+         .rate_reads
+         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+   }
+
+   /// Number of drain rate reads so far.
+   pub(crate) fn rate_reads(&self) -> usize {
+      self
+         .db
+         .rate_reads
+         .load(std::sync::atomic::Ordering::Relaxed)
    }
 
    /// Holds the database write lock on another thread for `duration`, as a slow writer
@@ -1301,7 +1325,7 @@ mod tests {
       tracker.save_to_study(TEST_ADDRESS, NoiseControlMode::Active);
 
       // Verify it was saved by checking the cache was cleared
-      assert!(tracker.historical_cache.lock().is_empty());
+      assert!(tracker.historical_cache.lock().is_none());
    }
 
    #[test]
@@ -1670,6 +1694,38 @@ mod tests {
       // history instead of extending the old one into a sudden drop
       tracker.record_battery_drop(mock_state(60, false), mock_state(60, false));
       assert_eq!(tracker.left_history.len(), 1);
+      Ok(())
+   }
+
+   #[test]
+   fn estimates_read_the_study_once_per_cache_period() -> Result<()> {
+      let (study, _dir) = create_test_db()?;
+      study.get_or_create_study(TEST_ADDRESS, SmolStr::new_static("Test AirPods"))?;
+      let mut tracker = BatteryTracker::new(Some(study.clone()));
+
+      // Nothing stored for any mode: battery reports keep coming all the same
+      for level in [80, 79, 78] {
+         let ttl = tracker.estimate_ttl(
+            &discharging_battery(level),
+            Some(NoiseControlMode::Active),
+            TEST_ADDRESS,
+         );
+         assert_eq!(ttl, None);
+      }
+      assert_eq!(study.rate_reads(), 1);
+
+      // A rate stored for another mode is found from one read too
+      study.update_drain_rate(TEST_ADDRESS, NoiseControlMode::Off, 10.0, 10)?;
+      let mut tracker = BatteryTracker::new(Some(study.clone()));
+      for level in [80, 79] {
+         let ttl = tracker.estimate_ttl(
+            &discharging_battery(level),
+            Some(NoiseControlMode::Active),
+            TEST_ADDRESS,
+         );
+         assert!(ttl.is_some());
+      }
+      assert_eq!(study.rate_reads(), 2);
       Ok(())
    }
 
