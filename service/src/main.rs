@@ -38,7 +38,9 @@ use crate::{airpods::device::AirPods, dbus::AirPodsServiceSignals, error::Result
 /// Maximum time to wait for devices to disconnect and data to be saved on shutdown
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[tokio::main]
+/// Two workers serve D-Bus and the device sockets with room to spare; the default of one
+/// per core only adds idle threads. Disk writes run on the separate blocking pool.
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
    // Parse command line arguments
    let args: Vec<String> = std::env::args().collect();
