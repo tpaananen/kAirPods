@@ -92,17 +92,20 @@ Item {
                     }
                 }
 
-                // Battery ring: faint track plus an arc showing the charge
+                // Battery ring: faint track plus an arc showing the charge.
+                // Headphones get one clockwise arc from the top. Earbuds get a
+                // half per earbud (left half = left earbud), each full at the
+                // bottom centre and draining up towards a gap at the top.
                 Canvas {
                     id: batteryRing
+                    objectName: "batteryRing"
                     visible: batteryLevels.length > 0
                     anchors.centerIn: parent
                     width: Math.round(parent.width * 1.6)
                     height: width
                     rotation: -90 // start from top
 
-                    // While drifting, the main arc runs to the lower earbud and an
-                    // orange band (bandEnd) covers the gap up to the higher one.
+                    // Headphones: single arc, so no drift band in practice.
                     readonly property int arcLevel: lrDrifting ? lowestBattery : averageBattery
                     readonly property int bandLevel: lrDrifting ? Math.max(...batteryLevels) : arcLevel
                     property real progress: Math.max(0, Math.min(100, arcLevel)) / 100
@@ -110,11 +113,28 @@ Item {
                     property color progressColor: Battery.levelColor(arcLevel, false)
                     property color trackColor: Kirigami.ColorUtils.adjustColor(Kirigami.Theme.textColor, {"alpha": -200})
 
+                    // Earbuds: while drifting, the higher earbud's half fills to
+                    // the lower one's level and an orange band covers the rest.
+                    readonly property var split: device?.connected ? Battery.splitRing(device.battery) : null
+                    property real leftFill: split ? split.left.fill : 0
+                    property real leftBand: split ? split.left.band : 0
+                    property real rightFill: split ? split.right.fill : 0
+                    property real rightBand: split ? split.right.band : 0
+                    property color leftColor: split ? split.left.color : Battery.GREEN
+                    property color rightColor: split ? split.right.color : Battery.GREEN
+
                     onProgressChanged: requestPaint()
                     onBandEndChanged: requestPaint()
                     onProgressColorChanged: requestPaint()
                     onTrackColorChanged: requestPaint()
                     onWidthChanged: requestPaint()
+                    onSplitChanged: requestPaint()
+                    onLeftFillChanged: requestPaint()
+                    onLeftBandChanged: requestPaint()
+                    onRightFillChanged: requestPaint()
+                    onRightBandChanged: requestPaint()
+                    onLeftColorChanged: requestPaint()
+                    onRightColorChanged: requestPaint()
 
                     onPaint: {
                         var ctx = getContext("2d")
@@ -123,6 +143,11 @@ Item {
                         var r = c - 2
                         ctx.lineWidth = 3
                         ctx.lineCap = "round"
+
+                        if (split) {
+                            paintSplit(ctx, c, r)
+                            return
+                        }
 
                         ctx.beginPath()
                         ctx.arc(c, c, r, 0, 2 * Math.PI)
@@ -144,10 +169,52 @@ Item {
                         }
                     }
 
+                    // Canvas angle 0 is 12 o'clock (rotated -90); positive runs
+                    // clockwise, so the right half spans gap..PI and the left
+                    // half mirrors it with negative angles.
+                    function paintSplit(ctx, c, r) {
+                        var gap = ctx.lineWidth / r // half-gap at the top; ~3 px stays clear of the round caps
+                        var span = Math.PI - gap
+
+                        ctx.beginPath()
+                        ctx.arc(c, c, r, gap, 2 * Math.PI - gap)
+                        ctx.strokeStyle = trackColor
+                        ctx.stroke()
+
+                        function half(sign, fill, band, color) {
+                            function stroke(from, to, style) {
+                                ctx.beginPath()
+                                ctx.arc(c, c, r, sign * (gap + span * from), sign * (gap + span * to), sign < 0)
+                                ctx.strokeStyle = style
+                                ctx.stroke()
+                            }
+                            // Charge runs from the top gap towards the bottom
+                            // centre, so draining opens the ring from the bottom.
+                            if (fill > 0)
+                                stroke(0, fill, color)
+                            if (band > fill)
+                                stroke(fill, band, Battery.ORANGE)
+                        }
+                        half(1, rightFill, rightBand, rightColor)
+                        half(-1, leftFill, leftBand, leftColor)
+                    }
+
                     Behavior on progress {
                         NumberAnimation { duration: 800; easing.type: Easing.InOutCubic }
                     }
                     Behavior on bandEnd {
+                        NumberAnimation { duration: 800; easing.type: Easing.InOutCubic }
+                    }
+                    Behavior on leftFill {
+                        NumberAnimation { duration: 800; easing.type: Easing.InOutCubic }
+                    }
+                    Behavior on leftBand {
+                        NumberAnimation { duration: 800; easing.type: Easing.InOutCubic }
+                    }
+                    Behavior on rightFill {
+                        NumberAnimation { duration: 800; easing.type: Easing.InOutCubic }
+                    }
+                    Behavior on rightBand {
                         NumberAnimation { duration: 800; easing.type: Easing.InOutCubic }
                     }
                 }

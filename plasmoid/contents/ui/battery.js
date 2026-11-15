@@ -23,6 +23,33 @@ function drift(battery) {
     return Math.abs(l.level - r.level)
 }
 
+/**
+ * Taskbar ring split into a left and a right earbud half, or null for
+ * headphones / no battery. Each side is {fill, band, color}: fill and band are
+ * 0..1 of the half, and band > fill marks the drift highlight. While drifting
+ * the higher earbud fills to the lower one's level and its band covers the
+ * difference, so the band shows only on the side with more charge left.
+ */
+function splitRing(battery) {
+    if (!battery || battery.headphone?.level != null) return null
+    var left = sideLevel(battery.left), right = sideLevel(battery.right)
+    var drifting = drift(battery) >= DRIFT_LEVEL
+    var low = Math.min(left, right)
+    function side(level) {
+        return {
+            fill: (drifting ? low : level) / 100,
+            band: level / 100,
+            color: levelColor(level, false)
+        }
+    }
+    return { left: side(left), right: side(right) }
+}
+
+function sideLevel(pod) {
+    if (!pod || pod.level == null) return 0
+    return Math.max(0, Math.min(100, pod.level))
+}
+
 /** Ring color for a battery `level` (0–100); green while `charging`. */
 function levelColor(level, charging) {
     if (charging) return GREEN
