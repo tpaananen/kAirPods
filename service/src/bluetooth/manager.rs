@@ -42,8 +42,8 @@ const AAP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const AAP_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Maximum AAP connection retry delay
 const MAX_AAP_RETRY_DELAY: Duration = Duration::from_secs(120);
-/// Device tick interval
-const DEVICE_TICK_INTERVAL: Duration = Duration::from_secs(10);
+/// Device tick interval; battery study saves are minutes apart
+const DEVICE_TICK_INTERVAL: Duration = Duration::from_secs(60);
 /// Channel buffer size
 const CHANNEL_BUFFER_SIZE: usize = 1000;
 
@@ -1379,14 +1379,13 @@ impl ManagerActor {
       }
    }
 
-   /// Runs the periodic device work, which may write to the battery study database.
+   /// Runs the periodic device work.
    ///
-   /// The writes wait for the disk, so they run on the blocking pool instead of holding
-   /// up the commands queued for the manager.
+   /// The checks are cheap; a battery study save that is due runs on the blocking pool,
+   /// so the disk does not hold up the commands queued for the manager.
    fn tick_all_devices(&self) {
       for device in self.devices.values() {
-         let device = device.device.clone();
-         tokio::task::spawn_blocking(move || device.tick());
+         device.device.tick();
       }
    }
 

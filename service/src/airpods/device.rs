@@ -47,6 +47,9 @@ use crate::{
 /// never answers stays silent: it is closed, so the manager reconnects.
 const FIRST_PACKET_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Minutes between periodic saves of the battery study during a connection
+const BATTERY_SAVE_INTERVAL_MINUTES: u32 = 5;
+
 /// Internal state for an active L2CAP connection.
 #[derive(Debug)]
 struct ConnectionState {
@@ -767,50 +770,48 @@ impl AirPods {
       }
    }
 
-   /// Checks if enough time has passed and samples collected to warrant a periodic save.
-   /// Returns true if data should be saved.
-   fn should_save_battery_study(&self, interval_minutes: u32) -> bool {
-      if let Some(battery) = self.battery_info() {
-         self
-            .0
-            .battery_tracker
-            .lock()
-            .should_save(interval_minutes, &battery)
-      } else {
-         false
-      }
-   }
-
-   /// Performs a periodic save of battery study data if conditions are met.
-   ///
-   /// The tracker is not held during the write, which waits for the disk: the packet
-   /// processor records battery reports meanwhile, and a disconnect is not held up.
-   fn periodic_battery_save(&self) {
-      let mode = self.noise_mode().unwrap_or_default();
-      let begun = self
-         .0
-         .battery_tracker
-         .lock()
-         .begin_save(self.address(), mode);
-      if let Some((pending, mark)) = begun
-         && pending.write()
-      {
-         self.0.battery_tracker.lock().finish_save(mark);
-      }
-   }
-
-   /// Performs all periodic tasks for the device.
+   /// Performs all periodic tasks for the device. Cheap: called on the manager.
    pub fn tick(&self) {
-      if self.is_connected() {
-         if self.should_save_battery_study(5) {
-            debug!("Performing periodic battery save for {}", self.address());
-            self.periodic_battery_save();
-         } else {
-            debug!("Battery save check for {} returned false", self.address());
-         }
-      } else {
-         debug!("Device {} not connected, skipping tick", self.address());
+      self.start_battery_save_if_due(BATTERY_SAVE_INTERVAL_MINUTES);
+   }
+
+   /// Starts a periodic save of the battery study if one is due, writing on the blocking
+   /// pool. Returns whether it started one.
+   fn start_battery_save_if_due(&self, interval_minutes: u32) -> bool {
+      let Some(save) = self.begin_battery_save(interval_minutes) else {
+         return false;
+      };
+      self.spawn_battery_write(save);
+      true
+   }
+
+   /// Takes the battery study data due for a periodic save, and returns the write.
+   ///
+   /// The data is taken now, so the next tick does not save it again; the write waits for
+   /// the disk and runs without holding the tracker, so battery reports and a disconnect
+   /// are not held up meanwhile.
+   fn begin_battery_save(&self, interval_minutes: u32) -> Option<impl FnOnce() + Send + 'static> {
+      if !self.is_connected() {
+         return None;
       }
+      let battery = self.battery_info()?;
+      let mode = self.noise_mode().unwrap_or_default();
+      let (pending, mark) = {
+         let mut tracker = self.0.battery_tracker.lock();
+         if !tracker.should_save(interval_minutes, &battery) {
+            return None;
+         }
+         tracker.begin_save(self.address(), mode)?
+      };
+      debug!("Performing periodic battery save for {}", self.address());
+      let weak = WeakAirPods::new(self);
+      Some(move || {
+         if pending.write()
+            && let Some(this) = weak.upgrade()
+         {
+            this.0.battery_tracker.lock().finish_save(mark);
+         }
+      })
    }
 }
 
@@ -1051,6 +1052,50 @@ mod tests {
       );
    }
 
+   /// Both earbuds discharging at `level`.
+   fn discharging_battery(level: u8) -> BatteryInfo {
+      let mut battery = BatteryInfo::new();
+      for bud in [&mut battery.left, &mut battery.right] {
+         bud.level = level;
+         bud.status = BatteryStatus::Discharging;
+      }
+      battery
+   }
+
+   #[tokio::test]
+   async fn tick_starts_a_battery_save_only_when_one_is_due() {
+      let (study, _dir) = BatteryStudy::open_temp();
+      study
+         .get_or_create_study(Address::default(), "test".into())
+         .unwrap();
+      let device = AirPods::new(Address::default(), "test".into(), None, Some(study.clone()));
+      device.0.battery_tracker.lock().record_test_drops(6);
+      let saved = || {
+         study
+            .get_drain_rate(Address::default(), NoiseControlMode::Off)
+            .unwrap()
+            .is_some()
+      };
+
+      // Not connected, then connected without a battery report yet
+      assert!(!device.start_battery_save_if_due(0));
+      device.set_connected_for_test(true);
+      assert!(!device.start_battery_save_if_due(0));
+
+      // The samples are from just now: the save interval has not passed
+      device.update_battery_info(discharging_battery(95));
+      device.tick();
+      assert!(device.0.battery_writes.lock().is_empty());
+
+      // Due: written off the caller, and waited for by a flush
+      assert!(device.start_battery_save_if_due(0));
+      device.flush_battery_writes().await;
+      assert!(saved());
+
+      // Nothing new to save
+      assert!(!device.start_battery_save_if_due(0));
+   }
+
    #[test]
    fn battery_report_does_not_wait_for_a_periodic_save() {
       let (study, _dir) = BatteryStudy::open_temp();
@@ -1059,14 +1104,14 @@ mod tests {
          .unwrap();
       let device = AirPods::new(Address::default(), "test".into(), None, Some(study.clone()));
       device.0.battery_tracker.lock().record_test_drops(6);
+      device.set_connected_for_test(true);
+      device.update_battery_info(discharging_battery(95));
       let event_tx: EventSender = Arc::new(RecordedEvents::default());
 
       // Another writer holds the database, as a slow disk would, while a save is due
       let writer = study.hold_write_lock(Duration::from_millis(500));
-      let saver = std::thread::spawn({
-         let device = device.clone();
-         move || device.periodic_battery_save()
-      });
+      let save = device.begin_battery_save(0).expect("a save is due");
+      let saver = std::thread::spawn(save);
       std::thread::sleep(Duration::from_millis(100));
 
       // A report arrives on the packet processor meanwhile
