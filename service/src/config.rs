@@ -3,7 +3,7 @@
 //! This module handles loading and saving configuration from disk,
 //! including known devices and connection parameters.
 
-use std::{env, fs, path::PathBuf};
+use std::{collections::HashSet, env, fs, path::PathBuf};
 
 use bluer::Address;
 use serde::{Deserialize, Serialize};
@@ -89,15 +89,16 @@ impl Config {
          .join("config.toml"))
    }
 
-   /// Checks if the given address is listed in `known_devices`.
+   /// Addresses listed in `known_devices`, parsed once.
    ///
-   /// Addresses are compared as addresses, so the case of the hex digits does not matter.
-   pub fn is_known_device(&self, address: Address) -> bool {
-      self.known_devices.iter().any(|d| {
-         d.address
-            .parse::<Address>()
-            .is_ok_and(|known| known == address)
-      })
+   /// Addresses are compared as addresses, so the case of the hex digits does not matter;
+   /// entries that are not addresses are left out.
+   pub fn known_addresses(&self) -> HashSet<Address> {
+      self
+         .known_devices
+         .iter()
+         .filter_map(|d| d.address.parse().ok())
+         .collect()
    }
 }
 
@@ -118,11 +119,15 @@ mod tests {
    }
 
    #[test]
-   fn known_device_address_ignores_case() {
-      let config: Config =
-         toml::from_str("[[known_devices]]\naddress = \"aa:bb:cc:dd:ee:0f\"\nname = \"Pods\"\n")
-            .unwrap();
-      assert!(config.is_known_device(Address([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x0F])));
-      assert!(!config.is_known_device(Address([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x00])));
+   fn known_addresses_ignore_case_and_skip_invalid_entries() {
+      let config: Config = toml::from_str(
+         "[[known_devices]]\naddress = \"aa:bb:cc:dd:ee:0f\"\nname = \"Pods\"\n\
+          [[known_devices]]\naddress = \"not an address\"\nname = \"Typo\"\n",
+      )
+      .unwrap();
+      let known = config.known_addresses();
+      assert_eq!(known.len(), 1);
+      assert!(known.contains(&Address([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x0F])));
+      assert!(!known.contains(&Address([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x00])));
    }
 }

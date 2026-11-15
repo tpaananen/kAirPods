@@ -100,12 +100,23 @@ fn manufacturer_product_id(data: &[u8]) -> Option<u32> {
    AIRPOD_PIDS.contains(&product_id).then_some(product_id)
 }
 
-pub async fn is_device_airpods(dev: &bluer::Device) -> bool {
+/// What the properties of a device say about it being `AirPods`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recognition {
+   AirPods,
+   /// Not recognized now; properties `BlueZ` reads later, such as the services, may still
+   /// show that it is
+   NotRecognized,
+   /// Another vendor's product, by its modalias: never `AirPods`, whatever it reports
+   OtherVendor,
+}
+
+pub async fn recognize(dev: &bluer::Device) -> Recognition {
    // 1. Check modalias (most reliable for connected devices)
    if let Ok(Some(modalias)) = dev.modalias().await {
       if !is_apple(&modalias) {
          // Another vendor's product is never AirPods, whatever its name or services
-         return false;
+         return Recognition::OtherVendor;
       }
       if AIRPOD_PIDS.contains(&modalias.product) {
          log::debug!(
@@ -113,7 +124,7 @@ pub async fn is_device_airpods(dev: &bluer::Device) -> bool {
             modalias.vendor,
             modalias.product
          );
-         return true;
+         return Recognition::AirPods;
       }
       // An Apple product not listed yet: the checks below may still recognize it
    }
@@ -124,7 +135,7 @@ pub async fn is_device_airpods(dev: &bluer::Device) -> bool {
       && manufacturer_product_id(apple_data).is_some()
    {
       log::debug!("AirPods detected via manufacturer data");
-      return true;
+      return Recognition::AirPods;
    }
 
    // 3. Check for the AAP service, the protocol this service speaks
@@ -132,7 +143,7 @@ pub async fn is_device_airpods(dev: &bluer::Device) -> bool {
       && uuids.contains(&AAP_SERVICE)
    {
       log::debug!("AirPods detected via AAP service UUID");
-      return true;
+      return Recognition::AirPods;
    }
 
    // 4. Last-chance name/alias pattern matching
@@ -141,7 +152,7 @@ pub async fn is_device_airpods(dev: &bluer::Device) -> bool {
       for pattern in AIRPOD_PATTERNS {
          if name.contains(pattern) {
             log::debug!("AirPods detected via name pattern: {name} => {pattern}");
-            return true;
+            return Recognition::AirPods;
          }
       }
    }
@@ -150,11 +161,11 @@ pub async fn is_device_airpods(dev: &bluer::Device) -> bool {
       for pattern in AIRPOD_PATTERNS {
          if alias.contains(pattern) {
             log::debug!("AirPods detected via alias pattern: {alias} => {pattern}");
-            return true;
+            return Recognition::AirPods;
          }
       }
    }
-   false
+   Recognition::NotRecognized
 }
 
 #[cfg(test)]

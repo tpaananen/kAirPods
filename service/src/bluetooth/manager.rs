@@ -3,7 +3,10 @@
 //! This module handles Bluetooth adapter management, device discovery,
 //! and connection lifecycle for `AirPods` devices.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+   collections::{HashMap, HashSet},
+   time::Duration,
+};
 
 use bluer::{
    Adapter, AdapterEvent, AdapterProperty, Address, DeviceEvent, DeviceProperty, Session,
@@ -20,7 +23,7 @@ use tokio::{
 };
 
 use crate::{
-   airpods::{self, device::AirPods},
+   airpods::{self, device::AirPods, recognition::Recognition},
    battery_study::BatteryStudy,
    config::Config,
    error::{AirPodsError, Result},
@@ -348,7 +351,8 @@ impl BluetoothManager {
 // === Manager Actor ===
 
 struct ManagerActor {
-   config: Config,
+   /// Addresses from the configuration, always treated as `AirPods`
+   known_devices: HashSet<Address>,
    event_tx: EventSender,
    command_rx: mpsc::Receiver<ManagerCommand>,
    loopback_rx: mpsc::Receiver<ManagerCommand>,
@@ -365,6 +369,9 @@ struct ManagerActor {
    device_monitors: HashMap<Address, DeviceMonitor>,
    /// Source of unique AAP connection attempt ids
    next_attempt: u64,
+   /// Connected devices of other vendors: the periodic scan stops asking `BlueZ` about
+   /// them until their link drops
+   other_vendor: HashSet<Address>,
 }
 
 impl ManagerActor {
@@ -378,7 +385,7 @@ impl ManagerActor {
 
       let (loopback_tx, loopback_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
       Ok(Self {
-         config,
+         known_devices: config.known_addresses(),
          event_tx,
          command_rx,
          loopback_rx,
@@ -390,6 +397,7 @@ impl ManagerActor {
          devices: HashMap::new(),
          device_monitors: HashMap::new(),
          next_attempt: 0,
+         other_vendor: HashSet::new(),
       })
    }
 
@@ -725,13 +733,11 @@ impl ManagerActor {
          .retain(|_, monitor| monitor.adapter_name != *adapter_name);
    }
 
-   async fn is_airpods_device(&self, device: &bluer::Device) -> bool {
-      // Check known addresses
-      let addr = device.address();
-      if self.config.is_known_device(addr) {
-         return true;
+   async fn recognize_device(&self, device: &bluer::Device) -> Recognition {
+      if self.known_devices.contains(&device.address()) {
+         return Recognition::AirPods;
       }
-      airpods::recognition::is_device_airpods(device).await
+      airpods::recognition::recognize(device).await
    }
 
    async fn handle_command(&mut self, cmd: ManagerCommand) -> bool {
@@ -891,6 +897,8 @@ impl ManagerActor {
    async fn handle_adapter_lost(&mut self, name: SmolStr) {
       warn!("Adapter lost: {name}");
       self.stop_adapter_device_monitors(&name);
+      // Disconnects are no longer reported: let the scan look at every device again
+      self.other_vendor.clear();
 
       let Some(info) = self.adapters.get_mut(&name) else {
          return;
@@ -959,6 +967,8 @@ impl ManagerActor {
 
    fn handle_adapter_error(&mut self, name: &SmolStr, error: String) {
       self.stop_adapter_device_monitors(name);
+      // Disconnects are no longer reported: let the scan look at every device again
+      self.other_vendor.clear();
       if let Some(info) = self.adapters.get_mut(name)
          && let Some(handle) = info.monitor_handle.take()
       {
@@ -988,7 +998,7 @@ impl ManagerActor {
          return;
       };
 
-      if !self.is_airpods_device(&device).await {
+      if self.recognize_device(&device).await != Recognition::AirPods {
          return;
       }
 
@@ -1061,6 +1071,7 @@ impl ManagerActor {
    }
 
    async fn handle_bluetooth_disconnected(&mut self, addr: Address) {
+      self.other_vendor.remove(&addr);
       if let Some(device) = self.devices.get_mut(&addr)
          && device.bluetooth_state == BluetoothState::Connected
       {
@@ -1163,6 +1174,7 @@ impl ManagerActor {
    async fn handle_device_lost(&mut self, addr: Address, adapter_name: SmolStr) {
       // The monitor's event stream has ended either way
       self.device_monitors.remove(&addr);
+      self.other_vendor.remove(&addr);
 
       let still_listed = match self.adapters.get(&adapter_name) {
          Some(info) => info
@@ -1348,23 +1360,31 @@ impl ManagerActor {
       }
    }
 
-   async fn scan_for_connected_airpods(&self) {
+   /// Looks for connected `AirPods` without AAP that the device events missed.
+   ///
+   /// Connected devices of other vendors are remembered, so later scans do not ask
+   /// `BlueZ` about them again while their link is up.
+   async fn scan_for_connected_airpods(&mut self) {
+      let mut other_vendor = Vec::new();
       for adapter_info in self.adapters.values() {
          if adapter_info.state != AdapterState::Active {
             continue;
          }
-
-         // Check all connected devices
-         if let Ok(addresses) = adapter_info.adapter.device_addresses().await {
-            for addr in addresses {
-               // Managed devices count only if they should be connecting on their own:
-               // connected, connecting, waiting for a retry or disconnected by the user
-               // are all as expected
-               if self.devices.get(&addr).is_none_or(ManagedDevice::wants_aap)
-                  && let Ok(device) = adapter_info.adapter.device(addr)
-                  && device.is_connected().await.unwrap_or(false)
-                  && self.is_airpods_device(&device).await
-               {
+         let Ok(addresses) = adapter_info.adapter.device_addresses().await else {
+            continue;
+         };
+         for addr in addresses {
+            if !scan_asks_about(addr, &self.devices, &self.other_vendor) {
+               continue;
+            }
+            let Ok(device) = adapter_info.adapter.device(addr) else {
+               continue;
+            };
+            if !device.is_connected().await.unwrap_or(false) {
+               continue;
+            }
+            match self.recognize_device(&device).await {
+               Recognition::AirPods => {
                   info!("Scan found connected AirPods {addr} without AAP; events missed it");
                   let _ = self
                      .loopback_tx
@@ -1373,10 +1393,13 @@ impl ManagerActor {
                         adapter_info.name.clone(),
                      ))
                      .await;
-               }
+               },
+               Recognition::OtherVendor => other_vendor.push(addr),
+               Recognition::NotRecognized => {},
             }
          }
       }
+      self.other_vendor.extend(other_vendor);
    }
 
    /// Runs the periodic device work.
@@ -1426,6 +1449,19 @@ impl ManagerActor {
          }
       }
    }
+}
+
+/// Whether the periodic scan asks `BlueZ` about the device at `addr`.
+///
+/// Managed devices count only if they should be connecting on their own: connected,
+/// connecting, waiting for a retry or disconnected by the user are all as expected.
+/// Connected devices of other vendors are never `AirPods`.
+fn scan_asks_about(
+   addr: Address,
+   devices: &HashMap<Address, ManagedDevice>,
+   other_vendor: &HashSet<Address>,
+) -> bool {
+   !other_vendor.contains(&addr) && devices.get(&addr).is_none_or(ManagedDevice::wants_aap)
 }
 
 /// Name and product id of a device, as `BlueZ` reports them now.
@@ -1577,6 +1613,25 @@ mod managed_device_tests {
 
    impl crate::event::EventBus for NoEvents {
       fn emit(&self, _device: &AirPods, _event: AirPodsEvent) {}
+   }
+
+   #[test]
+   fn scan_asks_only_about_devices_it_cannot_rule_out() {
+      let [unknown, idle, connected, mouse] = [1, 2, 3, 4].map(|n| Address([n; 6]));
+      let mut devices = HashMap::new();
+      devices.insert(idle, managed_device());
+      let mut open = managed_device();
+      open.aap_state = AAPState::Connected;
+      devices.insert(connected, open);
+      let other_vendor = HashSet::from([mouse]);
+
+      // An unknown device, and a managed one that should have AAP but has not
+      assert!(scan_asks_about(unknown, &devices, &other_vendor));
+      assert!(scan_asks_about(idle, &devices, &other_vendor));
+
+      // AAP as expected, and another vendor's connected device
+      assert!(!scan_asks_about(connected, &devices, &other_vendor));
+      assert!(!scan_asks_about(mouse, &devices, &other_vendor));
    }
 
    #[test]
