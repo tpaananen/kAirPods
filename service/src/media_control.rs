@@ -8,6 +8,7 @@ use std::{
    time::Duration,
 };
 
+use futures::future::join_all;
 use log::{debug, warn};
 use parking_lot::Mutex;
 use tokio::{sync::mpsc, time};
@@ -110,6 +111,25 @@ impl MediaControl {
    }
 }
 
+/// Prefix of the bus names of MPRIS media players
+const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
+
+/// The calls media control makes: to the players on the bus in the service, to fakes in
+/// tests. They have no timeout of their own; callers add [`CALL_TIMEOUT`].
+trait Players {
+   /// Names on the bus.
+   async fn names(&self) -> Result<Vec<String>, BoxError>;
+   /// Whether the player is playing.
+   async fn is_playing(&self, player: &str) -> Result<bool, BoxError>;
+   /// Calls an MPRIS player method, such as `Play` or `Pause`.
+   async fn command(&self, player: &str, method: &str) -> Result<(), BoxError>;
+}
+
+/// Runs a player call, giving up after [`CALL_TIMEOUT`].
+async fn timed<T>(call: impl Future<Output = Result<T, BoxError>>) -> Result<T, BoxError> {
+   time::timeout(CALL_TIMEOUT, call).await?
+}
+
 /// Sends a play command to all players we previously paused.
 /// Only plays if we previously paused the media.
 async fn send_play(connection: &Connection) {
@@ -130,22 +150,7 @@ async fn send_play(connection: &Connection) {
       paused_players.len(),
       paused_players
    );
-
-   // Resume all paused players
-   let mut successful = 0;
-
-   for player_name in &paused_players {
-      match send_mpris_command_to_player(connection, "Play", player_name).await {
-         Ok(()) => {
-            debug!("Successfully resumed player: {player_name}");
-            successful += 1;
-         },
-         Err(e) => {
-            warn!("Failed to resume player {player_name}: {e}");
-         },
-      }
-   }
-
+   let successful = resume_players(connection, &paused_players).await;
    debug!(
       "Resumed {}/{} players successfully",
       successful,
@@ -156,6 +161,24 @@ async fn send_play(connection: &Connection) {
    PAUSED_PLAYERS.lock().clear();
 }
 
+/// Resumes the players, all at once: a frozen one does not hold up the others. Returns
+/// how many did.
+async fn resume_players(players: &impl Players, paused: &[String]) -> usize {
+   let resumes = paused.iter().map(|player_name| async move {
+      match timed(players.command(player_name, "Play")).await {
+         Ok(()) => {
+            debug!("Successfully resumed player: {player_name}");
+            true
+         },
+         Err(e) => {
+            warn!("Failed to resume player {player_name}: {e}");
+            false
+         },
+      }
+   });
+   join_all(resumes).await.into_iter().filter(|&ok| ok).count()
+}
+
 /// Sends a pause command to all playing media players via MPRIS.
 /// Stores all players that were paused (only if they were playing).
 async fn send_pause(connection: &Connection) {
@@ -163,74 +186,7 @@ async fn send_pause(connection: &Connection) {
       return;
    }
 
-   // Find all playing players and pause them all
-   let dbus_proxy = match zbus::fdo::DBusProxy::new(connection).await {
-      Ok(proxy) => proxy,
-      Err(e) => {
-         warn!("Failed to create D-Bus proxy: {e}");
-         return;
-      },
-   };
-
-   let names = match time::timeout(CALL_TIMEOUT, dbus_proxy.list_names()).await {
-      Ok(Ok(names)) => names,
-      Ok(Err(e)) => {
-         warn!("Failed to list D-Bus names: {e}");
-         return;
-      },
-      Err(_) => {
-         warn!("Timed out listing D-Bus names");
-         return;
-      },
-   };
-
-   // Find all MPRIS media players (excluding KDE Connect, which is for remote control)
-   let mpris_services: Vec<_> = names
-      .iter()
-      .filter(|name| {
-         let name_str = name.as_str();
-         name_str.starts_with("org.mpris.MediaPlayer2.")
-            && !name_str.contains("kdeconnect")
-            && !name_str.contains("KDEConnect")
-      })
-      .collect();
-
-   if mpris_services.is_empty() {
-      debug!("No MPRIS media players found");
-      return;
-   }
-
-   debug!(
-      "Found {} MPRIS player(s), checking which are playing",
-      mpris_services.len()
-   );
-
-   let mut paused_players = Vec::new();
-
-   // Check each player and pause all that are playing
-   for service_name in &mpris_services {
-      // Check if this player is playing
-      if let Ok(was_playing) = is_player_playing(connection, service_name.as_str()).await {
-         if was_playing {
-            debug!("Player {service_name} is playing, pausing it");
-            // Pause this player
-            match send_mpris_command_to_player(connection, "Pause", service_name.as_str()).await {
-               Ok(()) => {
-                  debug!("Successfully paused player: {service_name}");
-                  paused_players.push(service_name.as_str().to_string());
-               },
-               Err(e) => {
-                  warn!("Failed to pause player {service_name}: {e}");
-               },
-            }
-         } else {
-            debug!("Player {service_name} is not playing, skipping");
-         }
-      } else {
-         debug!("Could not check playback status for player {service_name}, skipping");
-      }
-   }
-
+   let paused_players = pause_playing(connection).await;
    if paused_players.is_empty() {
       debug!("No playing players found to pause");
    } else {
@@ -244,58 +200,121 @@ async fn send_pause(connection: &Connection) {
    }
 }
 
-/// Checks if a specific player is currently playing.
-async fn is_player_playing(connection: &Connection, service_name: &str) -> Result<bool, BoxError> {
-   let path = zbus::zvariant::ObjectPath::from_str_unchecked("/org/mpris/MediaPlayer2");
-   let interface = "org.mpris.MediaPlayer2.Player";
-   let property = "PlaybackStatus";
-
-   let reply = time::timeout(
-      CALL_TIMEOUT,
-      connection.call_method(
-         Some(service_name),
-         &path,
-         Some("org.freedesktop.DBus.Properties"),
-         "Get",
-         &(interface, property),
-      ),
-   )
-   .await??;
-
-   let body = reply.body();
-   let variant: zbus::zvariant::Value = body.deserialize()?;
-   let status = match variant {
-      zbus::zvariant::Value::Str(s) => s.to_string(),
-      _ => {
-         if let Ok(s) = String::try_from(variant) {
-            s
-         } else {
-            return Ok(false);
-         }
+/// Pauses every playing media player. Returns the ones it paused, in bus order.
+async fn pause_playing(players: &impl Players) -> Vec<String> {
+   let names = match timed(players.names()).await {
+      Ok(names) => names,
+      Err(e) => {
+         warn!("Failed to list D-Bus names: {e}");
+         return Vec::new();
       },
    };
 
-   Ok(status == "Playing")
+   // Find all MPRIS media players (excluding KDE Connect, which is for remote control)
+   let mpris_services: Vec<_> = names
+      .into_iter()
+      .filter(|name| {
+         name.starts_with(MPRIS_PREFIX)
+            && !name.contains("kdeconnect")
+            && !name.contains("KDEConnect")
+      })
+      .collect();
+
+   if mpris_services.is_empty() {
+      debug!("No MPRIS media players found");
+      return Vec::new();
+   }
+
+   debug!(
+      "Found {} MPRIS player(s), checking which are playing",
+      mpris_services.len()
+   );
+
+   // All at once: a frozen player does not hold up pausing the others
+   let pauses = mpris_services
+      .into_iter()
+      .map(|service_name| pause_if_playing(players, service_name));
+   join_all(pauses).await.into_iter().flatten().collect()
 }
 
-/// Sends a command to a specific player by service name.
-async fn send_mpris_command_to_player(
-   connection: &Connection,
-   method: &str,
-   service_name: &str,
-) -> Result<(), BoxError> {
-   let path = zbus::zvariant::ObjectPath::from_str_unchecked("/org/mpris/MediaPlayer2");
-   let interface = "org.mpris.MediaPlayer2.Player";
+/// Pauses the player if it is playing. Returns its name if it paused it.
+async fn pause_if_playing(players: &impl Players, service_name: String) -> Option<String> {
+   match timed(players.is_playing(&service_name)).await {
+      Ok(true) => {},
+      Ok(false) => {
+         debug!("Player {service_name} is not playing, skipping");
+         return None;
+      },
+      Err(e) => {
+         debug!("Could not check playback status for player {service_name}, skipping: {e}");
+         return None;
+      },
+   }
+   debug!("Player {service_name} is playing, pausing it");
+   match timed(players.command(&service_name, "Pause")).await {
+      Ok(()) => {
+         debug!("Successfully paused player: {service_name}");
+         Some(service_name)
+      },
+      Err(e) => {
+         warn!("Failed to pause player {service_name}: {e}");
+         None
+      },
+   }
+}
 
-   debug!("Sending {method} command to specific player: {service_name}");
+impl Players for Connection {
+   async fn names(&self) -> Result<Vec<String>, BoxError> {
+      let reply = self
+         .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "ListNames",
+            &(),
+         )
+         .await?;
+      Ok(reply.body().deserialize()?)
+   }
 
-   time::timeout(
-      CALL_TIMEOUT,
-      connection.call_method(Some(service_name), &path, Some(interface), method, &()),
-   )
-   .await??;
+   async fn is_playing(&self, player: &str) -> Result<bool, BoxError> {
+      let reply = self
+         .call_method(
+            Some(player),
+            "/org/mpris/MediaPlayer2",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("org.mpris.MediaPlayer2.Player", "PlaybackStatus"),
+         )
+         .await?;
+      let body = reply.body();
+      let variant: zbus::zvariant::Value = body.deserialize()?;
+      let status = match variant {
+         zbus::zvariant::Value::Str(s) => s.to_string(),
+         _ => {
+            if let Ok(s) = String::try_from(variant) {
+               s
+            } else {
+               return Ok(false);
+            }
+         },
+      };
+      Ok(status == "Playing")
+   }
 
-   Ok(())
+   async fn command(&self, player: &str, method: &str) -> Result<(), BoxError> {
+      debug!("Sending {method} command to specific player: {player}");
+      self
+         .call_method(
+            Some(player),
+            "/org/mpris/MediaPlayer2",
+            Some("org.mpris.MediaPlayer2.Player"),
+            method,
+            &(),
+         )
+         .await?;
+      Ok(())
+   }
 }
 
 #[cfg(test)]
@@ -308,6 +327,86 @@ mod tests {
       right: crate::airpods::protocol::PodPlacement,
    ) -> EarDetectionStatus {
       EarDetectionStatus::new(left, right)
+   }
+
+   /// Players on a fake bus; those named `frozen` never answer.
+   #[derive(Default)]
+   struct FakePlayers {
+      names: Vec<String>,
+      /// Commands as they were made: player, method, time since the start
+      commands: Mutex<Vec<(String, String, Duration)>>,
+      start: Option<time::Instant>,
+   }
+
+   impl FakePlayers {
+      fn new(names: &[&str]) -> Self {
+         Self {
+            names: names.iter().map(|&n| n.to_owned()).collect(),
+            commands: Mutex::default(),
+            start: Some(time::Instant::now()),
+         }
+      }
+
+      async fn answer(player: &str) {
+         if player.contains("frozen") {
+            std::future::pending::<()>().await;
+         }
+      }
+   }
+
+   impl Players for FakePlayers {
+      async fn names(&self) -> Result<Vec<String>, BoxError> {
+         Ok(self.names.clone())
+      }
+
+      async fn is_playing(&self, player: &str) -> Result<bool, BoxError> {
+         Self::answer(player).await;
+         Ok(true)
+      }
+
+      async fn command(&self, player: &str, method: &str) -> Result<(), BoxError> {
+         Self::answer(player).await;
+         let at = self.start.unwrap().elapsed();
+         self
+            .commands
+            .lock()
+            .push((player.to_owned(), method.to_owned(), at));
+         Ok(())
+      }
+   }
+
+   const FROZEN: &str = "org.mpris.MediaPlayer2.frozen";
+   const PLAYER: &str = "org.mpris.MediaPlayer2.player";
+
+   #[tokio::test(start_paused = true)]
+   async fn a_frozen_player_does_not_delay_pausing_the_others() {
+      let players = FakePlayers::new(&[FROZEN, PLAYER, "org.kde.StatusNotifierWatcher"]);
+      let started = time::Instant::now();
+
+      let paused = pause_playing(&players).await;
+
+      assert_eq!(paused, [PLAYER]);
+      assert_eq!(
+         players.commands.lock().as_slice(),
+         [(PLAYER.to_owned(), "Pause".to_owned(), Duration::ZERO)]
+      );
+      // Given up on the frozen one after one timeout, not one per call
+      assert_eq!(started.elapsed(), CALL_TIMEOUT);
+   }
+
+   #[tokio::test(start_paused = true)]
+   async fn a_frozen_player_does_not_delay_resuming_the_others() {
+      let players = FakePlayers::new(&[]);
+      let started = time::Instant::now();
+
+      let resumed = resume_players(&players, &[FROZEN.to_owned(), PLAYER.to_owned()]).await;
+
+      assert_eq!(resumed, 1);
+      assert_eq!(
+         players.commands.lock().as_slice(),
+         [(PLAYER.to_owned(), "Play".to_owned(), Duration::ZERO)]
+      );
+      assert_eq!(started.elapsed(), CALL_TIMEOUT);
    }
 
    #[test]
