@@ -679,21 +679,11 @@ impl AirPods {
             self.set_feature_enabled(cmd, matches!(op, FeatureCmd::Enable));
          }
       } else {
-         let data = if packet.len() < 16 {
-            hex::encode(&packet)
-         } else {
-            format!(
-               "{}..{}",
-               hex::encode(&packet[..8]),
-               hex::encode(&packet[8..])
-            )
-         };
-
          debug!(
             "Unknown packet from {} | {} bytes => {}",
             address,
             packet.len(),
-            data
+            packet_summary(&packet)
          );
       }
    }
@@ -815,6 +805,22 @@ impl AirPods {
    }
 }
 
+/// Hex of a packet for the log: the first and last 8 bytes of a long one.
+///
+/// The receive loop logs every packet in full already. Called inside `debug!`, so it is
+/// built only when debug logging is on.
+fn packet_summary(packet: &[u8]) -> String {
+   if packet.len() < 16 {
+      hex::encode(packet)
+   } else {
+      format!(
+         "{}..{}",
+         hex::encode(&packet[..8]),
+         hex::encode(&packet[packet.len() - 8..])
+      )
+   }
+}
+
 #[cfg(test)]
 mod tests {
    use super::*;
@@ -823,6 +829,16 @@ mod tests {
       event::EventBus,
       media_control,
    };
+
+   #[test]
+   fn long_packets_are_shortened_in_the_log() {
+      assert_eq!(packet_summary(&[0x04, 0x00, 0xab]), "0400ab");
+      let packet: Vec<u8> = (0..20).collect();
+      assert_eq!(
+         packet_summary(&packet),
+         "0001020304050607..0c0d0e0f10111213"
+      );
+   }
 
    #[tokio::test]
    async fn connected_since_is_serialized_and_cleared_on_disconnect() {
