@@ -69,19 +69,42 @@ Item {
                    : Math.round(Math.min(root.width, root.height) * 0.7)
             height: root.height
 
-            // Main icon
-            Kirigami.Icon {
+            // Main glyph: the battery level, or the headphone icon until
+            // levels arrive
+            Item {
                 id: icon
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.left: parent.left
                 // Shrink the glyph (keeping it centered in its slot) so the
-                // battery ring has breathing room without growing overall.
+                // battery ring or connection pulse has breathing room without
+                // growing overall; with neither it fills its slot.
                 anchors.leftMargin: (slotWidth - width) / 2
                 visible: content.showIcon
                 readonly property real slotWidth: root.showPercentage ? content.iconSize : content.width
-                width: slotWidth * 0.8
+                readonly property bool ringed: batteryLevels.length > 0 || connectionPulse.visible
+                width: ringed ? slotWidth * 0.8 : slotWidth
                 height: width
-                source: "audio-headphones"
+
+                Kirigami.Icon {
+                    objectName: "headphoneIcon"
+                    anchors.fill: parent
+                    visible: batteryLevels.length === 0
+                    source: "audio-headphones"
+                }
+
+                // Earbuds show their average; headphones their own level
+                PlasmaComponents3.Label {
+                    objectName: "centreLevel"
+                    anchors.fill: parent
+                    visible: batteryLevels.length > 0
+                    text: String(averageBattery)
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                    font.pixelSize: parent.height * 0.8
+                    font.weight: Font.Medium
+                    fontSizeMode: Text.Fit
+                    minimumPixelSize: 6
+                }
 
                 // Scale animation on hover
                 scale: mouseArea.containsMouse ? 1.1 : 1.0
@@ -117,7 +140,7 @@ Item {
 
                     // Earbuds: while drifting, the higher earbud's half fills to
                     // the lower one's level and an orange band covers the rest.
-                    readonly property var split: device?.connected ? Battery.splitRing(device.battery) : null
+                    readonly property var split: device?.connected ? Battery.splitRing(device.battery, device.ear_detection) : null
                     property real leftFill: split ? split.left.fill : 0
                     property real leftBand: split ? split.left.band : 0
                     property real rightFill: split ? split.right.fill : 0
@@ -126,6 +149,11 @@ Item {
                     property color rightColor: split ? split.right.color : Battery.GREEN
                     property bool leftCharging: split ? split.left.charging : false
                     property bool rightCharging: split ? split.right.charging : false
+                    // Out-of-ear earbuds: their half is drawn faded
+                    property bool leftDim: split ? split.left.dim : false
+                    property bool rightDim: split ? split.right.dim : false
+                    // Earbuds: the ear-status dot sits in the gap at the top
+                    readonly property bool showEarDot: earDot.visible
 
                     onProgressChanged: requestPaint()
                     onBandEndChanged: requestPaint()
@@ -142,6 +170,9 @@ Item {
                     onHeadphoneChargingChanged: requestPaint()
                     onLeftChargingChanged: requestPaint()
                     onRightChargingChanged: requestPaint()
+                    onLeftDimChanged: requestPaint()
+                    onRightDimChanged: requestPaint()
+                    onShowEarDotChanged: requestPaint()
 
                     // Charging glow, as on the popup rings: the last stroked
                     // arc again, wider and faint. Kept within the canvas edge.
@@ -192,7 +223,9 @@ Item {
                     // clockwise, so the right half spans gap..PI and the left
                     // half mirrors it with negative angles.
                     function paintSplit(ctx, c, r) {
-                        var gap = ctx.lineWidth / r // half-gap at the top; ~3 px stays clear of the round caps
+                        // Half-gap at the top: ~3 px stays clear of the round
+                        // caps, widened to fit the ear dot when it shows.
+                        var gap = (ctx.lineWidth + (showEarDot ? earDot.width / 2 : 0)) / r
                         var span = Math.PI - gap
 
                         ctx.beginPath()
@@ -200,13 +233,15 @@ Item {
                         ctx.strokeStyle = trackColor
                         ctx.stroke()
 
-                        function half(sign, fill, band, color, charging) {
+                        function half(sign, fill, band, color, charging, dim) {
                             function stroke(from, to, style) {
                                 ctx.beginPath()
                                 ctx.arc(c, c, r, sign * (gap + span * from), sign * (gap + span * to), sign < 0)
                                 ctx.strokeStyle = style
                                 ctx.stroke()
                             }
+                            // Out of the ear: same length and color, faded.
+                            ctx.globalAlpha = dim ? Battery.DIM_OPACITY : 1
                             // Charge runs from the top gap towards the bottom
                             // centre, so draining opens the ring from the bottom.
                             if (fill > 0) {
@@ -216,9 +251,10 @@ Item {
                             }
                             if (band > fill)
                                 stroke(fill, band, Battery.ORANGE)
+                            ctx.globalAlpha = 1
                         }
-                        half(1, rightFill, rightBand, rightColor, rightCharging)
-                        half(-1, leftFill, leftBand, leftColor, leftCharging)
+                        half(1, rightFill, rightBand, rightColor, rightCharging, rightDim)
+                        half(-1, leftFill, leftBand, leftColor, leftCharging, leftDim)
                     }
 
                     Behavior on progress {
@@ -241,8 +277,32 @@ Item {
                     }
                 }
 
+                // Ear-status dot at the top of the ring, colored like the
+                // popup's ear dots and dimmed like the ring halves while
+                // only one earbud is worn (see Battery.earDot)
+                Rectangle {
+                    id: earDot
+                    objectName: "earDot"
+                    readonly property var dotState: device?.connected ? Battery.earDot(device) : null
+                    visible: dotState !== null
+                    width: 6
+                    height: width
+                    radius: width / 2
+                    anchors.horizontalCenter: batteryRing.horizontalCenter
+                    y: batteryRing.y + 2 - height / 2 // centred on the ring's stroke
+                    color: dotState?.color ?? "transparent"
+                    opacity: dotState?.dim ? Battery.DIM_OPACITY : 1
+                    Behavior on color {
+                        ColorAnimation { duration: 300 }
+                    }
+                    Behavior on opacity {
+                        NumberAnimation { duration: 300 }
+                    }
+                }
+
                 // Connection pulse
                 Rectangle {
+                    id: connectionPulse
                     visible: showPulseAnimation && device && device.connected && batteryLevels.length === 0
                     anchors.centerIn: parent
                     width: parent.width + 2 * Math.round(parent.width * 0.15)

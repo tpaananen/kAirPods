@@ -212,7 +212,7 @@ Item {
         height: width
         radius: width / 2
 
-        color: !inEar ? "#757575" : highlightLevel ? Battery.ORANGE : Battery.GREEN
+        color: !inEar ? Battery.GREY : highlightLevel ? Battery.ORANGE : Battery.GREEN
 
         Behavior on color {
             ColorAnimation { duration: 300 }
